@@ -14,6 +14,7 @@ ENV_CLASSES = {
     "math": safe_import("rllm.environments.base.single_turn_env", "SingleTurnEnvironment"),
     "code": safe_import("rllm.environments.base.single_turn_env", "SingleTurnEnvironment"),
     "swe": safe_import("rllm.environments.swe.swe", "SWEEnv"),
+    "swe_ppio": safe_import("rllm.environments.swe_ppio.swe_ppio", "SWEBenchPPIOEnv"),
     "competition_coding": safe_import("rllm.environments.code.competition_coding", "CompetitionCodingEnv"),
     "single_turn_env": safe_import("rllm.environments.base.single_turn_env", "SingleTurnEnvironment"),
 }

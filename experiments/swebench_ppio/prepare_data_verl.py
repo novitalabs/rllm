@@ -28,8 +28,9 @@ def main():
                 "style": "rule",
                 "ground_truth": None,
             },
-            # Store original entry as extra_info (as JSON string to ensure compatibility)
-            "extra_info": json.dumps({
+            # Store original entry as extra_info (as dict, verl expects dict)
+            "extra_info": {
+                "index": i,
                 "repo": entry["repo"],
                 "instance_id": entry["instance_id"],
                 "base_commit": entry["base_commit"],
@@ -41,7 +42,7 @@ def main():
                 "FAIL_TO_PASS": entry.get("FAIL_TO_PASS", ""),
                 "PASS_TO_PASS": entry.get("PASS_TO_PASS", ""),
                 "environment_setup_commit": entry.get("environment_setup_commit", ""),
-            }),
+            },
         }
         processed_data.append(processed_entry)
 
@@ -62,7 +63,8 @@ def main():
     print(f"\nSample entry:")
     print(f"  prompt: {sample['prompt']}")
     print(f"  reward_model: {sample['reward_model']}")
-    extra = json.loads(sample['extra_info'])
+    extra = sample['extra_info']
+    print(f"  extra_info.index: {extra.get('index', 'N/A')}")
     print(f"  extra_info.instance_id: {extra['instance_id']}")
     print(f"  extra_info.repo: {extra['repo']}")
 
