@@ -44,6 +44,11 @@ def prepare_dataset(dataset_name: str, output_name: str, output_dir: Path):
         if isinstance(pass_to_pass, list):
             pass_to_pass = str(pass_to_pass)
 
+        # R2E-Gym uses different field names than SWE-Bench
+        repo = entry.get("repo", "") or entry.get("repo_name", "")
+        base_commit = entry.get("base_commit", "") or entry.get("commit_hash", "HEAD")
+        instance_id = entry.get("instance_id", "") or f"{repo.replace('/', '__')}-{base_commit[:8]}" if repo else f"{output_name}_{i}"
+
         processed_entry = {
             "prompt": [{"role": "user", "content": "placeholder"}],
             "reward_model": {
@@ -52,9 +57,9 @@ def prepare_dataset(dataset_name: str, output_name: str, output_dir: Path):
             },
             "extra_info": {
                 "index": i,
-                "repo": entry.get("repo", ""),
-                "instance_id": entry.get("instance_id", f"{output_name}_{i}"),
-                "base_commit": entry.get("base_commit", "HEAD"),
+                "repo": repo,
+                "instance_id": instance_id,
+                "base_commit": base_commit,
                 "patch": entry.get("patch", ""),
                 "test_patch": entry.get("test_patch", ""),
                 "problem_statement": entry.get("problem_statement", ""),
@@ -63,6 +68,10 @@ def prepare_dataset(dataset_name: str, output_name: str, output_dir: Path):
                 "FAIL_TO_PASS": fail_to_pass,
                 "PASS_TO_PASS": pass_to_pass,
                 "environment_setup_commit": entry.get("environment_setup_commit", ""),
+                # R2E-Gym specific fields
+                "docker_image": entry.get("docker_image", ""),
+                "expected_output_json": entry.get("expected_output_json", ""),
+                "modified_files": entry.get("modified_files", []),
             },
         }
         processed_data.append(processed_entry)
