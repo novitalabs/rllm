@@ -145,12 +145,20 @@ def test_in_sandbox(entry: dict, patch: str, api_key: str) -> dict:
         print("OK")
 
         print(f"[Sandbox] Cloning {github_repo}...", end=" ", flush=True)
-        exit_code, _ = manager._run_command(
-            f"git clone --depth 1 https://github.com/{github_repo}.git /home/user/testbed 2>&1",
+        # Try ghproxy mirror first, fallback to direct GitHub
+        exit_code, output = manager._run_command(
+            f"git clone --depth 1 https://ghproxy.com/https://github.com/{github_repo}.git /home/user/testbed 2>&1",
             timeout=300
         )
         if exit_code != 0:
-            print("FAILED")
+            print("ghproxy failed, trying direct...")
+            manager._run_command("rm -rf /home/user/testbed", timeout=30)
+            exit_code, output = manager._run_command(
+                f"git clone --depth 1 https://github.com/{github_repo}.git /home/user/testbed 2>&1",
+                timeout=600
+            )
+        if exit_code != 0:
+            print(f"FAILED: {output[:300]}")
             return result
         print("OK")
         result["clone_ok"] = True
@@ -240,7 +248,7 @@ def main():
     print(f"\n[3] Generating patch with {args.model}")
 
     if args.skip_inference:
-        # Mock patch for testing
+        # Mock patch for testing - fetch actual code to generate correct patch
         print("    (Using mock patch for testing)")
         response = """
 Here's the fix:
@@ -249,11 +257,12 @@ Here's the fix:
 diff --git a/coverage/debug.py b/coverage/debug.py
 --- a/coverage/debug.py
 +++ b/coverage/debug.py
-@@ -100,7 +100,7 @@ def info_formatter(info):
-     \"\"\"Format info as a string.\"\"\"
--    for label, data in info:
-+    for label, data in list(info):
-         yield f"{label}: {data}"
+@@ -141,6 +141,7 @@ def info_formatter(info: Iterable[Tuple[str, Any]]) -> Iterable[str]:
+     if not info:
+         return
+
++    info = list(info)
+     for label, data in info:
 ```
 """
     elif args.use_api:
