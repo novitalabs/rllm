@@ -18,6 +18,7 @@ from .ppio_reward import (
     extract_patch_from_response,
     parse_pytest_output,
     setup_proxy_tunnel,
+    get_sandbox_pool,
 )
 
 
@@ -28,6 +29,10 @@ setup_proxy_tunnel()
 class SWEBenchPPIOEnv(BaseEnv):
     """SWE-bench Environment using PPIO Sandbox"""
 
+    # Class-level trajectory counter for pool indexing
+    _trajectory_counter = 0
+    _counter_lock = None
+
     def __init__(
         self,
         entry: Optional[dict] = None,
@@ -35,6 +40,8 @@ class SWEBenchPPIOEnv(BaseEnv):
         idx: Optional[int] = None,
         timeout: int = 3600,
         workdir: str = "/home/user/testbed",
+        use_pool: bool = True,
+        pool_size: int = 16,
     ):
         """Initialize the environment.
 
@@ -44,12 +51,25 @@ class SWEBenchPPIOEnv(BaseEnv):
             idx: Index in dataset (optional)
             timeout: Sandbox timeout in seconds
             workdir: Working directory in sandbox
+            use_pool: Whether to use sandbox pool (recommended to avoid 429)
+            pool_size: Size of sandbox pool for reuse
         """
+        import threading
+        if SWEBenchPPIOEnv._counter_lock is None:
+            SWEBenchPPIOEnv._counter_lock = threading.Lock()
+
         self.entry = entry
         self.dataset = dataset
         self._idx = idx
         self.timeout = timeout
         self.workdir = workdir
+        self.use_pool = use_pool
+        self.pool_size = pool_size
+
+        # Assign trajectory index from counter
+        with SWEBenchPPIOEnv._counter_lock:
+            self.trajectory_idx = SWEBenchPPIOEnv._trajectory_counter
+            SWEBenchPPIOEnv._trajectory_counter += 1
 
         self.sandbox_manager: Optional[PPIOSandboxManager] = None
         self.api_key = self._load_api_key()
@@ -84,14 +104,19 @@ class SWEBenchPPIOEnv(BaseEnv):
         Returns:
             Tuple of (observation_dict, info_dict)
         """
-        # Close any existing sandbox
-        self.close()
+        # Release sandbox back to pool (pause, don't destroy)
+        if self.sandbox_manager:
+            self.sandbox_manager.cleanup(pause=True)
+            self.sandbox_manager = None
 
-        # Create new sandbox
+        # Get sandbox from pool (reuses existing or creates new)
         self.sandbox_manager = PPIOSandboxManager(
             api_key=self.api_key,
             timeout=self.timeout,
             workdir=self.workdir,
+            use_pool=self.use_pool,
+            trajectory_idx=self.trajectory_idx,
+            pool_size=self.pool_size,
         )
         self.sandbox_manager.create_sandbox()
 
@@ -219,10 +244,16 @@ Your response should include a patch in unified diff format starting with "diff 
         return 0.0
 
     def close(self):
-        """Clean up resources."""
+        """Clean up resources (pause sandbox, keep in pool)."""
         if self.sandbox_manager:
-            self.sandbox_manager.cleanup()
+            self.sandbox_manager.cleanup(pause=True)
             self.sandbox_manager = None
+
+    @classmethod
+    def cleanup_pool(cls):
+        """Clean up all sandboxes in the pool. Call at end of training."""
+        pool = get_sandbox_pool()
+        pool.cleanup_all()
 
     @staticmethod
     def from_dict(info: dict) -> "SWEBenchPPIOEnv":
@@ -231,6 +262,8 @@ Your response should include a patch in unified diff format starting with "diff 
             entry=info.get("entry"),
             timeout=info.get("timeout", 3600),
             workdir=info.get("workdir", "/home/user/testbed"),
+            use_pool=info.get("use_pool", True),
+            pool_size=info.get("pool_size", 16),
         )
 
     @staticmethod

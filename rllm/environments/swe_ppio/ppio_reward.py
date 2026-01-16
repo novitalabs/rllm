@@ -95,23 +95,181 @@ class TestResult:
 
 
 # =============================================================================
+# Sandbox Pool Manager (Singleton)
+# =============================================================================
+import threading
+from typing import Dict, List
+
+
+class SandboxPool:
+    """
+    Global sandbox pool to avoid 429 rate limit errors.
+
+    Key optimizations from verl/ppio/docs/sandbox/optimization:
+    1. Reuse sandboxes via pool (generation_idx % pool_size)
+    2. Pause/resume instead of create/destroy
+    3. Exponential backoff retry for rate limits
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._pool: Dict[int, any] = {}  # sandbox_idx -> sandbox
+        self._pool_lock = threading.Lock()
+        self._api_key: str = ""
+        self._timeout: int = 3600
+        self._pool_size: int = 16  # Default pool size
+        self._max_retries: int = 5
+        self._base_delay: float = 2.0  # Base delay for exponential backoff
+
+    def configure(self, api_key: str, pool_size: int = 16, timeout: int = 3600):
+        """Configure the pool parameters."""
+        self._api_key = api_key
+        self._pool_size = pool_size
+        self._timeout = timeout
+        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}")
+
+    def get_sandbox(self, trajectory_idx: int, workdir: str = "/home/user/testbed"):
+        """
+        Get a sandbox for the given trajectory index.
+        Uses modulo to map trajectory_idx to pool slot for reuse.
+        """
+        sandbox_idx = trajectory_idx % self._pool_size
+
+        with self._pool_lock:
+            if sandbox_idx in self._pool and self._pool[sandbox_idx] is not None:
+                sandbox = self._pool[sandbox_idx]
+                # Try to resume if paused
+                try:
+                    sandbox.connect()
+                    print(f"[SandboxPool] Reusing sandbox {sandbox_idx} for trajectory {trajectory_idx}")
+                    # Clean workdir for new task
+                    sandbox.commands.run(f"rm -rf {workdir}/* 2>/dev/null; mkdir -p {workdir}", timeout=30)
+                    return sandbox
+                except Exception as e:
+                    print(f"[SandboxPool] Failed to resume sandbox {sandbox_idx}: {e}")
+                    self._pool[sandbox_idx] = None
+
+            # Create new sandbox with retry
+            sandbox = self._create_with_retry(sandbox_idx, workdir)
+            self._pool[sandbox_idx] = sandbox
+            return sandbox
+
+    def _create_with_retry(self, sandbox_idx: int, workdir: str):
+        """Create sandbox with exponential backoff retry for rate limits."""
+        from ppio_sandbox.core import Sandbox
+
+        last_error = None
+        for attempt in range(self._max_retries):
+            try:
+                sandbox = Sandbox.create(api_key=self._api_key, timeout=self._timeout)
+                sandbox.commands.run(f"mkdir -p {workdir}", timeout=10)
+                print(f"[SandboxPool] Created sandbox {sandbox_idx} (attempt {attempt + 1})")
+                return sandbox
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                if "429" in error_str or "rate limit" in error_str:
+                    delay = self._base_delay * (2 ** attempt)  # Exponential backoff
+                    print(f"[SandboxPool] Rate limit hit, retrying in {delay:.1f}s (attempt {attempt + 1}/{self._max_retries})")
+                    time.sleep(delay)
+                else:
+                    print(f"[SandboxPool] Sandbox creation failed: {e}")
+                    raise
+
+        raise RuntimeError(f"Failed to create sandbox after {self._max_retries} retries: {last_error}")
+
+    def release_sandbox(self, trajectory_idx: int, pause: bool = True):
+        """
+        Release sandbox back to pool.
+        If pause=True, pause the sandbox to save resources.
+        """
+        sandbox_idx = trajectory_idx % self._pool_size
+
+        with self._pool_lock:
+            if sandbox_idx in self._pool and self._pool[sandbox_idx] is not None:
+                sandbox = self._pool[sandbox_idx]
+                if pause:
+                    try:
+                        sandbox.beta_pause()
+                        print(f"[SandboxPool] Paused sandbox {sandbox_idx}")
+                    except Exception as e:
+                        print(f"[SandboxPool] Failed to pause sandbox {sandbox_idx}: {e}")
+
+    def cleanup_all(self):
+        """Kill all sandboxes in the pool."""
+        with self._pool_lock:
+            for idx, sandbox in self._pool.items():
+                if sandbox is not None:
+                    try:
+                        sandbox.kill()
+                        print(f"[SandboxPool] Killed sandbox {idx}")
+                    except:
+                        pass
+            self._pool.clear()
+            print(f"[SandboxPool] Cleaned up all sandboxes")
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    @property
+    def active_count(self) -> int:
+        with self._pool_lock:
+            return sum(1 for s in self._pool.values() if s is not None)
+
+
+# Global pool instance
+_sandbox_pool = SandboxPool()
+
+
+def get_sandbox_pool() -> SandboxPool:
+    """Get the global sandbox pool instance."""
+    return _sandbox_pool
+
+
+# =============================================================================
 # PPIO Sandbox Manager
 # =============================================================================
 class PPIOSandboxManager:
     """Manages PPIO sandbox lifecycle for SWE-bench evaluation"""
 
-    def __init__(self, api_key: str, timeout: int = 3600, workdir: str = "/home/user/testbed"):
+    def __init__(self, api_key: str, timeout: int = 3600, workdir: str = "/home/user/testbed",
+                 use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 16):
         self.api_key = api_key
         self.timeout = timeout
         self.workdir = workdir
         self.sandbox = None
+        self.use_pool = use_pool
+        self.trajectory_idx = trajectory_idx
+        self.pool_size = pool_size
+
+        # Configure pool if using it
+        if use_pool:
+            pool = get_sandbox_pool()
+            pool.configure(api_key, pool_size=pool_size, timeout=timeout)
 
     def create_sandbox(self):
-        """Create a new PPIO sandbox"""
-        from ppio_sandbox.core import Sandbox
-        self.sandbox = Sandbox.create(api_key=self.api_key, timeout=self.timeout)
-        # Create workdir
-        self.sandbox.commands.run(f"mkdir -p {self.workdir}", timeout=10)
+        """Create or get a sandbox from pool"""
+        if self.use_pool:
+            pool = get_sandbox_pool()
+            self.sandbox = pool.get_sandbox(self.trajectory_idx, self.workdir)
+        else:
+            # Legacy: create new sandbox directly
+            from ppio_sandbox.core import Sandbox
+            self.sandbox = Sandbox.create(api_key=self.api_key, timeout=self.timeout)
+            self.sandbox.commands.run(f"mkdir -p {self.workdir}", timeout=10)
         return self.sandbox
 
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
@@ -182,13 +340,17 @@ class PPIOSandboxManager:
         """Run tests and return exit code and output"""
         return self._run_command(f"cd {self.workdir} && {test_cmd} 2>&1", timeout=timeout)
 
-    def cleanup(self):
-        """Kill the sandbox"""
+    def cleanup(self, pause: bool = True):
+        """Release sandbox back to pool (pause) or kill if not using pool"""
         if self.sandbox:
-            try:
-                self.sandbox.kill()
-            except:
-                pass
+            if self.use_pool:
+                pool = get_sandbox_pool()
+                pool.release_sandbox(self.trajectory_idx, pause=pause)
+            else:
+                try:
+                    self.sandbox.kill()
+                except:
+                    pass
             self.sandbox = None
 
 
