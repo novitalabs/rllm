@@ -129,7 +129,7 @@ class SandboxPool:
         self._pool_lock = threading.Lock()
         self._api_key: str = ""
         self._timeout: int = 3600
-        self._pool_size: int = 16  # Default pool size
+        self._pool_size: int = 32  # Default pool size (optimized from 16)
         self._max_retries: int = 5
         self._base_delay: float = 2.0  # Base delay for exponential backoff
 

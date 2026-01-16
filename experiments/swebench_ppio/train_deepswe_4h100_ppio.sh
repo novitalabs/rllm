@@ -4,22 +4,29 @@ set -x
 # Training script for DeepSWE reproduction on 4x H100 GPUs with PPIO sandbox
 # Based on train_deepswe_32b.sh, adjusted for 4 GPUs
 
-# Set PYTHONPATH for rllm
+# Set PYTHONPATH for rllm and R2E-Gym
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export RLLM_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-export PYTHONPATH="$RLLM_DIR:$PYTHONPATH"
+export R2EGYM_DIR="/home/claude/work/R2E-Gym/src"
+export PYTHONPATH="$RLLM_DIR:$R2EGYM_DIR:$PYTHONPATH"
 export PATH="$HOME/.local/bin:$PATH"
 
 # Activate rllm venv
 source "$RLLM_DIR/venv/bin/activate"
 
 # CUDA environment
-export CUDA_HOME=/usr/local/cuda-12.5
+export CUDA_HOME=/usr/local/cuda-12.9
 export PATH=$CUDA_HOME/bin:$PATH
 
-# vLLM settings
+# Proxy settings
+export https_proxy=http://172.17.0.1:1081
+export http_proxy=http://172.17.0.1:1081
+
+# vLLM settings (vLLM 0.10.2 - no V1 engine)
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export VLLM_USE_V1=1
+
+# Disable wandb logging (no API key configured)
+export WANDB_MODE=disabled
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
@@ -87,7 +94,8 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
