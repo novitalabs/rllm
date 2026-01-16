@@ -86,13 +86,35 @@ def generate_with_vllm(prompt: str, model_name: str = "Qwen/Qwen3-8B") -> str:
     """Generate response using vLLM with chat template."""
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
+    import torch
 
     print(f"Loading model {model_name}...")
+
+    # Use tensor parallel for large models (>14B)
+    num_gpus = torch.cuda.device_count()
+    tp_size = 1
+    max_len = 16384
+    gpu_mem_util = 0.9
+
+    if "32B" in model_name or "70B" in model_name:
+        tp_size = min(4, num_gpus)  # Use up to 4 GPUs for large models
+    elif "30B" in model_name:
+        # MoE 30B models need 4 GPUs and lower memory settings
+        tp_size = min(4, num_gpus)
+        max_len = 8192  # Reduce context length to save memory
+        gpu_mem_util = 0.85
+    elif "14B" in model_name:
+        tp_size = min(2, num_gpus)
+
+    print(f"    Using tensor_parallel_size={tp_size} with {num_gpus} GPUs available")
+    print(f"    max_model_len={max_len}, gpu_memory_utilization={gpu_mem_util}")
+
     llm = LLM(
         model=model_name,
         trust_remote_code=True,
-        max_model_len=16384,
-        gpu_memory_utilization=0.9,
+        max_model_len=max_len,
+        gpu_memory_utilization=gpu_mem_util,
+        tensor_parallel_size=tp_size,
     )
 
     # Apply chat template for instruct models
@@ -151,7 +173,7 @@ def test_in_sandbox(entry: dict, patch: str, api_key: str) -> dict:
 
     manager = PPIOSandboxManager(
         api_key=api_key,
-        timeout=600,
+        timeout=1200,  # 20 min for slow model loading
         workdir="/home/user/testbed",
         use_pool=False,
     )
@@ -262,7 +284,7 @@ def run_complete_rollout(entry: dict, args, api_key: str) -> dict:
 
     manager = PPIOSandboxManager(
         api_key=api_key,
-        timeout=600,
+        timeout=1200,  # 20 min for slow model loading
         workdir="/home/user/testbed",
         use_pool=False,
     )
