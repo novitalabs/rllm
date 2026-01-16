@@ -132,13 +132,16 @@ class SandboxPool:
         self._pool_size: int = 32  # Default pool size (optimized from 16)
         self._max_retries: int = 5
         self._base_delay: float = 2.0  # Base delay for exponential backoff
+        self._template: str = os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
-    def configure(self, api_key: str, pool_size: int = 16, timeout: int = 3600):
+    def configure(self, api_key: str, pool_size: int = 16, timeout: int = 3600, template: str = None):
         """Configure the pool parameters."""
         self._api_key = api_key
         self._pool_size = pool_size
         self._timeout = timeout
-        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}")
+        if template:
+            self._template = template
+        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}, template={self._template}")
 
     def get_sandbox(self, trajectory_idx: int, workdir: str = "/home/user/testbed"):
         """
@@ -173,9 +176,14 @@ class SandboxPool:
         last_error = None
         for attempt in range(self._max_retries):
             try:
-                sandbox = Sandbox.create(api_key=self._api_key, timeout=self._timeout)
+                # Use custom template if configured (e.g., r2e-gym-base)
+                sandbox = Sandbox.create(
+                    api_key=self._api_key,
+                    timeout=self._timeout,
+                    template=self._template
+                )
                 sandbox.commands.run(f"mkdir -p {workdir}", timeout=10)
-                print(f"[SandboxPool] Created sandbox {sandbox_idx} (attempt {attempt + 1})")
+                print(f"[SandboxPool] Created sandbox {sandbox_idx} with template={self._template} (attempt {attempt + 1})")
                 return sandbox
             except Exception as e:
                 last_error = e
@@ -246,7 +254,8 @@ class PPIOSandboxManager:
     """Manages PPIO sandbox lifecycle for SWE-bench evaluation"""
 
     def __init__(self, api_key: str, timeout: int = 3600, workdir: str = "/home/user/testbed",
-                 use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 16):
+                 use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 16,
+                 template: str = None):
         self.api_key = api_key
         self.timeout = timeout
         self.workdir = workdir
@@ -254,11 +263,13 @@ class PPIOSandboxManager:
         self.use_pool = use_pool
         self.trajectory_idx = trajectory_idx
         self.pool_size = pool_size
+        # Template: can be "base", "sandbox-fusion", "r2e-gym-base", etc.
+        self.template = template or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
         # Configure pool if using it
         if use_pool:
             pool = get_sandbox_pool()
-            pool.configure(api_key, pool_size=pool_size, timeout=timeout)
+            pool.configure(api_key, pool_size=pool_size, timeout=timeout, template=self.template)
 
     def create_sandbox(self):
         """Create or get a sandbox from pool"""
@@ -268,7 +279,11 @@ class PPIOSandboxManager:
         else:
             # Legacy: create new sandbox directly
             from ppio_sandbox.core import Sandbox
-            self.sandbox = Sandbox.create(api_key=self.api_key, timeout=self.timeout)
+            self.sandbox = Sandbox.create(
+                api_key=self.api_key,
+                timeout=self.timeout,
+                template=self.template
+            )
             self.sandbox.commands.run(f"mkdir -p {self.workdir}", timeout=10)
         return self.sandbox
 
