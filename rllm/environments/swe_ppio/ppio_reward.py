@@ -444,6 +444,8 @@ def parse_pytest_output(output: str, fail_to_pass: list, pass_to_pass: list) -> 
 # =============================================================================
 def extract_patch_from_response(response: str) -> str:
     """Extract patch from model response"""
+    import re
+
     # Look for diff format
     patch_start = response.find("diff --git")
     if patch_start == -1:
@@ -457,7 +459,17 @@ def extract_patch_from_response(response: str) -> str:
     if patch_end == -1:
         patch_end = len(response)
 
-    return response[patch_start:patch_end].strip()
+    patch = response[patch_start:patch_end].strip()
+
+    # Clean up line number prefixes (e.g., "3: " at start of lines)
+    lines = patch.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Remove line number prefix like "3: " or "123: "
+        cleaned = re.sub(r'^\d+:\s?', '', line)
+        cleaned_lines.append(cleaned)
+
+    return '\n'.join(cleaned_lines)
 
 
 # =============================================================================
