@@ -7,6 +7,8 @@ using PPIO sandbox for code execution instead of Docker.
 """
 
 import os
+import json
+import re
 import socket
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +26,57 @@ from .ppio_reward import (
 
 # Setup proxy
 setup_proxy_tunnel()
+
+
+# Hardcoded test commands for common repos (from SWE-bench harness)
+REPO_TEST_CMDS = {
+    "django/django": "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
+    "sympy/sympy": "bin/test -C --verbose",
+    "pytest-dev/pytest": "pytest -rA",
+    "matplotlib/matplotlib": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "scikit-learn/scikit-learn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "astropy/astropy": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "sphinx-doc/sphinx": "tox -e py39 --",
+    "pylint-dev/pylint": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "pallets/flask": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "psf/requests": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "pydata/xarray": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "mwaskom/seaborn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+}
+
+
+def get_test_cmd_for_repo(repo: str) -> str:
+    """Get repo-specific test command."""
+    return REPO_TEST_CMDS.get(repo, "pytest -xvs")
+
+
+def convert_test_names_for_django(fail_to_pass):
+    """Convert unittest test names to Django module format.
+
+    Django tests use format: test_method(module.TestClass)
+    Need to extract module path for runtests.py
+    """
+    modules = set()
+    for test in fail_to_pass:
+        match = re.match(r"[^(]+\(([^)]+)\)", test)
+        if match:
+            full_path = match.group(1)
+            parts = full_path.rsplit(".", 1)
+            if len(parts) >= 1:
+                modules.add(parts[0])
+        else:
+            modules.add(test)
+    return " ".join(sorted(modules))
+
+
+def parse_fail_to_pass(fail_to_pass):
+    """Handle JSON string parsing (some datasets store as string)."""
+    if isinstance(fail_to_pass, str):
+        try:
+            return json.loads(fail_to_pass)
+        except json.JSONDecodeError:
+            return [fail_to_pass]
+    return fail_to_pass if fail_to_pass else []
 
 
 class SWEBenchPPIOEnv(BaseEnv):
@@ -193,11 +246,22 @@ Your response should include a patch in unified diff format starting with "diff 
         # Run tests
         fail_to_pass = self.entry.get("FAIL_TO_PASS", []) if self.entry else []
         pass_to_pass = self.entry.get("PASS_TO_PASS", []) if self.entry else []
-        test_cmd = self.entry.get("test_cmd", "pytest -xvs") if self.entry else "pytest -xvs"
+
+        # Parse JSON strings if needed (some datasets store as string)
+        fail_to_pass = parse_fail_to_pass(fail_to_pass)
+        pass_to_pass = parse_fail_to_pass(pass_to_pass)
+
+        # Get repo-specific test command
+        repo = self.entry.get("repo", "") if self.entry else ""
+        test_cmd = get_test_cmd_for_repo(repo)
+        is_django = "runtests.py" in test_cmd
 
         # Build test command
         if fail_to_pass:
-            tests_to_run = " ".join(fail_to_pass)
+            if is_django:
+                tests_to_run = convert_test_names_for_django(fail_to_pass)
+            else:
+                tests_to_run = " ".join(fail_to_pass)
             full_test_cmd = f"{test_cmd} {tests_to_run}"
         else:
             full_test_cmd = test_cmd
@@ -270,58 +334,3 @@ Your response should include a patch in unified diff format starting with "diff 
     def is_multithread_safe() -> bool:
         """PPIO sandboxes are isolated, so multithread safe."""
         return True
-
-
-# =============================================================================
-# Test
-# =============================================================================
-if __name__ == "__main__":
-    # Test with a simple entry
-    entry = {
-        "instance_id": "pallets__click-test",
-        "repo": "pallets/click",
-        "base_commit": "HEAD",
-        "problem_statement": "This is a test problem for validation.",
-        "FAIL_TO_PASS": [],
-        "PASS_TO_PASS": [],
-        "test_cmd": "pytest tests/test_basic.py -v --tb=short",
-        "install_cmd": "pip install -e . pytest 2>&1",
-    }
-
-    print("Testing SWEBenchPPIOEnv...")
-    env = SWEBenchPPIOEnv(entry=entry)
-
-    try:
-        # Reset environment
-        print("\n[1] Resetting environment...")
-        task, info = env.reset()
-        print(f"Task instruction:\n{task[:500]}...")
-        print(f"Info: {info}")
-
-        # Take a step with a simple patch
-        print("\n[2] Taking a step with a patch...")
-        action = '''
-Here is a simple fix:
-
-```diff
-diff --git a/src/click/core.py b/src/click/core.py
---- a/src/click/core.py
-+++ b/src/click/core.py
-@@ -1,3 +1,4 @@
-+# Test comment added by PPIO env
- from __future__ import annotations
-
- import collections.abc as cabc
-```
-'''
-        obs, reward, done, step_info = env.step(action)
-        print(f"Observation:\n{obs}")
-        print(f"Reward: {reward}")
-        print(f"Done: {done}")
-        print(f"Info: {step_info}")
-
-    finally:
-        # Cleanup
-        print("\n[3] Closing environment...")
-        env.close()
-        print("Done!")
