@@ -22,6 +22,13 @@ This document tracks all rllm/DeepSWE training and evaluation experiments conduc
 
 **Objective:** Validate PPIO sandbox API for SWE-bench environment execution.
 
+**Scripts Used:**
+- `experiments/swebench_ppio/test_ppio_api.py` - API connectivity tests (9 tests)
+- `experiments/swebench_ppio/test_workflow.py` - SWE-bench workflow validation
+- `experiments/swebench_ppio/ppio_reward.py` - Reward function implementation
+- `experiments/swebench_ppio/ppio_env.py` - Environment implementation
+- `experiments/swebench_ppio/run_validation.py` - End-to-end validation
+
 **Results:**
 - 9/9 API endpoint tests passed
 - Sandbox creation: ~5-10 seconds
@@ -40,6 +47,11 @@ MAX_CONCURRENT = 32
 ### 2. verl+PPIO GRPO Training v1 (2026-01-15)
 
 **Objective:** Initial GRPO training with PPIO sandbox backend.
+
+**Scripts Used:**
+- `experiments/swebench_ppio/prepare_data_verl.py` - Convert SWE-bench to verl format
+- `experiments/swebench_ppio/train_qwen3_4b_swe.sh` - Training script (blocked on 196.2 by GLIBC)
+- `experiments/swebench_ppio/train_qwen3_4b_swe_ppio.sh` - Training script for 196.3
 
 **Model:** Qwen3-4B (4B parameters)
 
@@ -73,6 +85,14 @@ MAX_CONCURRENT = 32
 
 **Objective:** Scale up training with larger models and longer sequences.
 
+**Scripts Used:**
+- `experiments/swebench_ppio/train_qwen3_4b_swe_ppio.sh` - v4-v7 on RTX 4090
+- `experiments/swebench_ppio/train_deepswe_4h100_ppio.sh` - v8-v9 on 4x H100
+- `experiments/swebench_ppio/test_template.py` - Template verification
+- `experiments/swebench_ppio/test_rollout.py` - Complete rollout with LLM inference
+- `experiments/swebench_ppio/test_repo_setup_time.py` - Repo setup time benchmark
+- `experiments/swebench_ppio/test_all_repos_sample.py` - All repos pipeline test
+
 **Experiments:**
 
 | Version | Model | Sequence Length | Status |
@@ -102,6 +122,9 @@ RTX 4090 (24GB) cannot handle:
 ### 4. Qwen3-32B BF16 Evaluation (2026-01-28 to 2026-01-30)
 
 **Objective:** Evaluate Qwen3-32B on SWE-bench Verified with PPIO backend.
+
+**Scripts Used:**
+- `experiments/swebench_ppio/prepare_r2e_gym_data.py` - R2E-Gym dataset preparation
 
 **Model:** Qwen/Qwen3-32B (32B dense, ~64GB BF16)
 
@@ -234,9 +257,11 @@ Features implemented for R2E-Gym compatibility:
 ```
 /home/claude/work/rllm/
 ├── experiments/swebench_ppio/
-│   ├── swebench_ppio_eval.py           # vLLM+PPIO eval
-│   ├── swebench_tinker_ppio_eval.py    # Tinker+PPIO eval
-│   ├── tinker_r2e_training_v2.py       # RL training script
+│   ├── test_ppio_api.py                # API connectivity tests
+│   ├── test_workflow.py                # SWE-bench workflow validation
+│   ├── test_rollout.py                 # Complete rollout test
+│   ├── prepare_r2e_gym_data.py         # R2E-Gym dataset preparation
+│   ├── train_deepswe_4h100_ppio.sh     # H100 training script
 │   └── template/                        # PPIO template dockerfiles
 ├── rllm/environments/swe_ppio/
 │   ├── swe_ppio.py                     # Environment implementation
@@ -257,4 +282,4 @@ Features implemented for R2E-Gym compatibility:
 
 ---
 
-*Last updated: 2026-02-02*
+*Last updated: 2026-02-03*
