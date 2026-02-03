@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (r5ylt7y9zok3osgu9qud) or template name (swebench-mwaskom-seaborn) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("swebench-mwaskom-seaborn") # Sync sandbox
+# sandbox = await AsyncSandbox.create("swebench-mwaskom-seaborn") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('swebench-mwaskom-seaborn')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "swebench-mwaskom-seaborn"
+template_id = "r5ylt7y9zok3osgu9qud"

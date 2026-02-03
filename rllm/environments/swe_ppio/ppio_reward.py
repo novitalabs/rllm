@@ -95,6 +95,29 @@ class TestResult:
 
 
 # =============================================================================
+# Pre-built PPIO Templates for SWE-bench repos
+# =============================================================================
+# These templates have repos pre-cloned at /testbed with dependencies installed
+REPO_TEMPLATE_MAP = {
+    "pallets/flask": "swebench-pallets-flask",
+    "psf/requests": "swebench-psf-requests",
+    "pytest-dev/pytest": "swebench-pytest-dev-pytest",
+    "pylint-dev/pylint": "swebench-pylint-dev-pylint",
+    "django/django": "swebench-django-django",
+    "sympy/sympy": "swebench-sympy-sympy",
+    "sphinx-doc/sphinx": "swebench-sphinx-doc-sphinx",
+    "matplotlib/matplotlib": "swebench-matplotlib-matplotlib",
+    "scikit-learn/scikit-learn": "swebench-scikit-learn-scikit-learn",
+    "astropy/astropy": "swebench-astropy-astropy",
+    "pydata/xarray": "swebench-pydata-xarray",
+    "mwaskom/seaborn": "swebench-mwaskom-seaborn",
+}
+
+# Default workdir for pre-built templates
+DEFAULT_WORKDIR = "/testbed"
+
+
+# =============================================================================
 # Sandbox Pool Manager (Singleton)
 # =============================================================================
 import threading
@@ -105,9 +128,9 @@ class SandboxPool:
     """
     Global sandbox pool to avoid 429 rate limit errors.
 
-    Key optimizations from verl/ppio/docs/sandbox/optimization:
-    1. Reuse sandboxes via pool (generation_idx % pool_size)
-    2. Pause/resume instead of create/destroy
+    Key optimizations:
+    1. Use pre-built templates per repo (REPO_TEMPLATE_MAP)
+    2. Per-repo sandbox pools for efficient reuse
     3. Exponential backoff retry for rate limits
     """
     _instance = None
@@ -125,65 +148,77 @@ class SandboxPool:
         if self._initialized:
             return
         self._initialized = True
-        self._pool: Dict[int, any] = {}  # sandbox_idx -> sandbox
+        # Per-repo sandbox pools: repo -> {sandbox_idx -> sandbox}
+        self._repo_pools: Dict[str, Dict[int, any]] = {}
         self._pool_lock = threading.Lock()
         self._api_key: str = ""
         self._timeout: int = 3600
-        self._pool_size: int = 32  # Default pool size (optimized from 16)
+        self._pool_size: int = 32  # Pool size per repo (skill recommends 32+)
         self._max_retries: int = 5
         self._base_delay: float = 2.0  # Base delay for exponential backoff
-        self._template: str = os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
+        self._default_template: str = os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
-    def configure(self, api_key: str, pool_size: int = 16, timeout: int = 3600, template: str = None):
+    def configure(self, api_key: str, pool_size: int = 32, timeout: int = 3600, template: str = None):
         """Configure the pool parameters."""
         self._api_key = api_key
         self._pool_size = pool_size
         self._timeout = timeout
         if template:
-            self._template = template
-        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}, template={self._template}")
+            self._default_template = template
+        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}")
 
-    def get_sandbox(self, trajectory_idx: int, workdir: str = "/home/user/testbed"):
+    def get_sandbox(self, trajectory_idx: int, repo: str = "", workdir: str = DEFAULT_WORKDIR):
         """
-        Get a sandbox for the given trajectory index.
-        Uses modulo to map trajectory_idx to pool slot for reuse.
+        Get a sandbox for the given trajectory index and repo.
+        Uses per-repo pools with pre-built templates when available.
         """
+        # Determine template to use
+        template = REPO_TEMPLATE_MAP.get(repo, self._default_template)
+        using_prebuilt = repo in REPO_TEMPLATE_MAP
+
+        # Use repo-specific pool key
+        pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
 
         with self._pool_lock:
-            if sandbox_idx in self._pool and self._pool[sandbox_idx] is not None:
-                sandbox = self._pool[sandbox_idx]
+            # Initialize repo pool if needed
+            if pool_key not in self._repo_pools:
+                self._repo_pools[pool_key] = {}
+
+            pool = self._repo_pools[pool_key]
+
+            if sandbox_idx in pool and pool[sandbox_idx] is not None:
+                sandbox = pool[sandbox_idx]
                 # Try to resume if paused
                 try:
                     sandbox.connect()
-                    print(f"[SandboxPool] Reusing sandbox {sandbox_idx} for trajectory {trajectory_idx}")
-                    # Clean workdir for new task
-                    sandbox.commands.run(f"rm -rf {workdir}/* 2>/dev/null; mkdir -p {workdir}", timeout=30)
-                    return sandbox
+                    print(f"[SandboxPool] Reusing sandbox [{pool_key}][{sandbox_idx}] for trajectory {trajectory_idx}")
+                    return sandbox, using_prebuilt
                 except Exception as e:
-                    print(f"[SandboxPool] Failed to resume sandbox {sandbox_idx}: {e}")
-                    self._pool[sandbox_idx] = None
+                    print(f"[SandboxPool] Failed to resume sandbox [{pool_key}][{sandbox_idx}]: {e}")
+                    pool[sandbox_idx] = None
 
             # Create new sandbox with retry
-            sandbox = self._create_with_retry(sandbox_idx, workdir)
-            self._pool[sandbox_idx] = sandbox
-            return sandbox
+            sandbox = self._create_with_retry(sandbox_idx, template, pool_key, workdir)
+            pool[sandbox_idx] = sandbox
+            return sandbox, using_prebuilt
 
-    def _create_with_retry(self, sandbox_idx: int, workdir: str):
+    def _create_with_retry(self, sandbox_idx: int, template: str, pool_key: str, workdir: str):
         """Create sandbox with exponential backoff retry for rate limits."""
         from ppio_sandbox.core import Sandbox
 
         last_error = None
         for attempt in range(self._max_retries):
             try:
-                # Use custom template if configured (e.g., r2e-gym-base)
                 sandbox = Sandbox.create(
                     api_key=self._api_key,
                     timeout=self._timeout,
-                    template=self._template
+                    template=template
                 )
-                sandbox.commands.run(f"mkdir -p {workdir}", timeout=10)
-                print(f"[SandboxPool] Created sandbox {sandbox_idx} with template={self._template} (attempt {attempt + 1})")
+                # Fix permissions and git safe.directory for pre-built templates
+                sandbox.commands.run(f"chmod -R 777 {workdir} 2>/dev/null || true", timeout=30)
+                sandbox.commands.run(f"git config --global --add safe.directory {workdir}", timeout=10)
+                print(f"[SandboxPool] Created sandbox [{pool_key}][{sandbox_idx}] with template={template} (attempt {attempt + 1})")
                 return sandbox
             except Exception as e:
                 last_error = e
@@ -198,34 +233,40 @@ class SandboxPool:
 
         raise RuntimeError(f"Failed to create sandbox after {self._max_retries} retries: {last_error}")
 
-    def release_sandbox(self, trajectory_idx: int, pause: bool = True):
+    def release_sandbox(self, trajectory_idx: int, repo: str = "", pause: bool = True):
         """
         Release sandbox back to pool.
         If pause=True, pause the sandbox to save resources.
         """
+        pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
 
         with self._pool_lock:
-            if sandbox_idx in self._pool and self._pool[sandbox_idx] is not None:
-                sandbox = self._pool[sandbox_idx]
+            if pool_key not in self._repo_pools:
+                return
+            pool = self._repo_pools[pool_key]
+            if sandbox_idx in pool and pool[sandbox_idx] is not None:
+                sandbox = pool[sandbox_idx]
                 if pause:
                     try:
                         sandbox.beta_pause()
-                        print(f"[SandboxPool] Paused sandbox {sandbox_idx}")
+                        print(f"[SandboxPool] Paused sandbox [{pool_key}][{sandbox_idx}]")
                     except Exception as e:
-                        print(f"[SandboxPool] Failed to pause sandbox {sandbox_idx}: {e}")
+                        print(f"[SandboxPool] Failed to pause sandbox [{pool_key}][{sandbox_idx}]: {e}")
 
     def cleanup_all(self):
-        """Kill all sandboxes in the pool."""
+        """Kill all sandboxes in all pools."""
         with self._pool_lock:
-            for idx, sandbox in self._pool.items():
-                if sandbox is not None:
-                    try:
-                        sandbox.kill()
-                        print(f"[SandboxPool] Killed sandbox {idx}")
-                    except:
-                        pass
-            self._pool.clear()
+            for pool_key, pool in self._repo_pools.items():
+                for idx, sandbox in pool.items():
+                    if sandbox is not None:
+                        try:
+                            sandbox.kill()
+                            print(f"[SandboxPool] Killed sandbox [{pool_key}][{idx}]")
+                        except:
+                            pass
+                pool.clear()
+            self._repo_pools.clear()
             print(f"[SandboxPool] Cleaned up all sandboxes")
 
     @property
@@ -253,9 +294,9 @@ def get_sandbox_pool() -> SandboxPool:
 class PPIOSandboxManager:
     """Manages PPIO sandbox lifecycle for SWE-bench evaluation"""
 
-    def __init__(self, api_key: str, timeout: int = 3600, workdir: str = "/home/user/testbed",
-                 use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 16,
-                 template: str = None):
+    def __init__(self, api_key: str, timeout: int = 3600, workdir: str = DEFAULT_WORKDIR,
+                 use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 32,
+                 template: str = None, repo: str = ""):
         self.api_key = api_key
         self.timeout = timeout
         self.workdir = workdir
@@ -263,8 +304,10 @@ class PPIOSandboxManager:
         self.use_pool = use_pool
         self.trajectory_idx = trajectory_idx
         self.pool_size = pool_size
-        # Template: can be "base", "sandbox-fusion", "r2e-gym-base", etc.
-        self.template = template or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
+        self.repo = repo
+        self.using_prebuilt = False  # Will be set when sandbox is created
+        # Template: can be "base", repo-specific template, etc.
+        self.template = template or REPO_TEMPLATE_MAP.get(repo) or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
         # Configure pool if using it
         if use_pool:
@@ -275,7 +318,9 @@ class PPIOSandboxManager:
         """Create or get a sandbox from pool"""
         if self.use_pool:
             pool = get_sandbox_pool()
-            self.sandbox = pool.get_sandbox(self.trajectory_idx, self.workdir)
+            self.sandbox, self.using_prebuilt = pool.get_sandbox(
+                self.trajectory_idx, repo=self.repo, workdir=self.workdir
+            )
         else:
             # Legacy: create new sandbox directly
             from ppio_sandbox.core import Sandbox
@@ -284,7 +329,10 @@ class PPIOSandboxManager:
                 timeout=self.timeout,
                 template=self.template
             )
-            self.sandbox.commands.run(f"mkdir -p {self.workdir}", timeout=10)
+            # Fix permissions and git safe.directory for pre-built templates
+            self.sandbox.commands.run(f"chmod -R 777 {self.workdir} 2>/dev/null || true", timeout=30)
+            self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
+            self.using_prebuilt = self.repo in REPO_TEMPLATE_MAP
         return self.sandbox
 
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
@@ -301,8 +349,37 @@ class PPIOSandboxManager:
             return 1, f"Command failed: {error_str}"
 
     def clone_repo(self, repo_url: str, commit: Optional[str] = None) -> tuple[bool, str]:
-        """Clone repository and checkout specific commit"""
-        # Clone with depth 1 if commit is HEAD, otherwise full clone
+        """Clone repository and checkout specific commit.
+
+        If using a pre-built template, the repo is already cloned at workdir.
+        Just need to fetch and checkout the specific commit.
+        """
+        if self.using_prebuilt:
+            # Pre-built template: repo already cloned at /testbed
+            # Just need to reset and checkout the specific commit
+            print(f"[PPIOSandboxManager] Using pre-built template, checking out {commit}")
+
+            # Reset any local changes (hard reset is more reliable for pre-built templates)
+            self._run_command(f"cd {self.workdir} && git reset --hard HEAD 2>/dev/null || true", timeout=30)
+            self._run_command(f"cd {self.workdir} && git clean -fd 2>/dev/null || true", timeout=30)
+
+            if commit and commit != "HEAD":
+                # Fetch to get latest refs
+                self._run_command(f"cd {self.workdir} && git fetch origin", timeout=300)
+                # Try direct checkout
+                exit_code, output = self._run_command(f"cd {self.workdir} && git checkout -f {commit} 2>&1", timeout=60)
+                if exit_code != 0:
+                    # Fetch the specific commit
+                    self._run_command(f"cd {self.workdir} && git fetch origin {commit}", timeout=120)
+                    exit_code, output = self._run_command(f"cd {self.workdir} && git checkout -f {commit} 2>&1", timeout=60)
+                    if exit_code != 0:
+                        return False, f"Checkout failed (exit={exit_code}): {output}"
+            return True, "Success (pre-built template)"
+
+        # Not using pre-built template: clone from scratch
+        # Clean up workdir first
+        self._run_command(f"rm -rf {self.workdir}/* 2>/dev/null; mkdir -p {self.workdir}", timeout=30)
+
         if commit and commit != "HEAD":
             # For specific commits, need full clone or fetch
             cmd = f"cd {self.workdir} && git clone {repo_url} . 2>&1"
@@ -323,19 +400,34 @@ class PPIOSandboxManager:
 
     def apply_patch(self, patch: str) -> tuple[bool, str]:
         """Apply patch to the repository"""
-        # Write patch file
-        self.sandbox.files.write("/tmp/patch.diff", patch)
+        import base64
 
         # Verify we're in a git repo
         exit_code, output = self._run_command(f"cd {self.workdir} && git status 2>&1", timeout=30)
         if exit_code != 0:
             return False, f"Not in a git repository: {output}"
 
+        # Write patch file to workdir (more reliable than /tmp)
+        patch_file = f"{self.workdir}/patch.diff"
+
+        # Use base64 encoding to avoid issues with special characters
+        patch_b64 = base64.b64encode(patch.encode()).decode()
+        exit_code, _ = self._run_command(
+            f"echo '{patch_b64}' | base64 -d > {patch_file}",
+            timeout=30
+        )
+        if exit_code != 0:
+            # Fallback: try using PPIO files API
+            try:
+                self.sandbox.files.write(patch_file, patch)
+            except Exception as e:
+                return False, f"Failed to write patch file: {e}"
+
         # Try different apply methods
         apply_cmds = [
-            "git apply --verbose /tmp/patch.diff",
-            "git apply --verbose --reject /tmp/patch.diff",
-            "patch --batch --fuzz=5 -p1 -i /tmp/patch.diff",
+            f"git apply --verbose {patch_file}",
+            f"git apply --verbose --reject {patch_file}",
+            f"patch --batch --fuzz=5 -p1 -i {patch_file}",
         ]
 
         outputs = []
@@ -343,12 +435,24 @@ class PPIOSandboxManager:
             exit_code, result_output = self._run_command(f"cd {self.workdir} && {cmd} 2>&1", timeout=60)
             outputs.append(f"{cmd}: exit={exit_code}, output={result_output[:500]}")
             if exit_code == 0:
+                # Clean up patch file
+                self._run_command(f"rm -f {patch_file}", timeout=10)
                 return True, result_output
+
+        # Clean up patch file even on failure
+        self._run_command(f"rm -f {patch_file}", timeout=10)
         return False, "\n".join(outputs)
 
     def install_deps(self, install_cmd: str = "pip install -e . 2>&1") -> bool:
-        """Install dependencies"""
-        exit_code, _ = self._run_command(f"cd {self.workdir} && {install_cmd}", timeout=600)
+        """Install dependencies.
+
+        For pre-built templates, dependencies are already installed.
+        Just run install again to handle any version-specific requirements.
+        """
+        if self.using_prebuilt:
+            # Pre-built template: try quick reinstall (may fail, that's ok)
+            print(f"[PPIOSandboxManager] Pre-built template, running install: {install_cmd}")
+        exit_code, output = self._run_command(f"cd {self.workdir} && {install_cmd}", timeout=600)
         return exit_code == 0
 
     def run_tests(self, test_cmd: str, timeout: int = 1800) -> tuple[int, str]:
@@ -360,7 +464,7 @@ class PPIOSandboxManager:
         if self.sandbox:
             if self.use_pool:
                 pool = get_sandbox_pool()
-                pool.release_sandbox(self.trajectory_idx, pause=pause)
+                pool.release_sandbox(self.trajectory_idx, repo=self.repo, pause=pause)
             else:
                 try:
                     self.sandbox.kill()

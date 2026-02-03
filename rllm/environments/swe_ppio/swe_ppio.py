@@ -21,6 +21,8 @@ from .ppio_reward import (
     parse_pytest_output,
     setup_proxy_tunnel,
     get_sandbox_pool,
+    DEFAULT_WORKDIR,
+    REPO_TEMPLATE_MAP,
 )
 
 
@@ -92,9 +94,9 @@ class SWEBenchPPIOEnv(BaseEnv):
         dataset: Optional[Any] = None,
         idx: Optional[int] = None,
         timeout: int = 3600,
-        workdir: str = "/home/user/testbed",
+        workdir: str = DEFAULT_WORKDIR,
         use_pool: bool = True,
-        pool_size: int = 16,
+        pool_size: int = 32,
     ):
         """Initialize the environment.
 
@@ -103,7 +105,7 @@ class SWEBenchPPIOEnv(BaseEnv):
             dataset: Dataset to select from (optional)
             idx: Index in dataset (optional)
             timeout: Sandbox timeout in seconds
-            workdir: Working directory in sandbox
+            workdir: Working directory in sandbox (default: /testbed for pre-built templates)
             use_pool: Whether to use sandbox pool (recommended to avoid 429)
             pool_size: Size of sandbox pool for reuse
         """
@@ -128,6 +130,9 @@ class SWEBenchPPIOEnv(BaseEnv):
         self.api_key = self._load_api_key()
         self.task_instruction = ""
         self.total_steps = 0
+
+        # Get repo from entry for template selection
+        self.repo = entry.get("repo", "") if entry else ""
 
     @property
     def idx(self) -> Any:
@@ -162,7 +167,12 @@ class SWEBenchPPIOEnv(BaseEnv):
             self.sandbox_manager.cleanup(pause=True)
             self.sandbox_manager = None
 
+        # Update repo from entry if available
+        if self.entry:
+            self.repo = self.entry.get("repo", "")
+
         # Get sandbox from pool (reuses existing or creates new)
+        # Pass repo for pre-built template selection
         self.sandbox_manager = PPIOSandboxManager(
             api_key=self.api_key,
             timeout=self.timeout,
@@ -170,6 +180,7 @@ class SWEBenchPPIOEnv(BaseEnv):
             use_pool=self.use_pool,
             trajectory_idx=self.trajectory_idx,
             pool_size=self.pool_size,
+            repo=self.repo,
         )
         self.sandbox_manager.create_sandbox()
 
@@ -180,17 +191,21 @@ class SWEBenchPPIOEnv(BaseEnv):
 
             if repo:
                 repo_url = f"https://github.com/{repo}.git"
-                print(f"[reset] Cloning {repo_url} at {base_commit}...")
+                using_prebuilt = repo in REPO_TEMPLATE_MAP
+                if using_prebuilt:
+                    print(f"[reset] Using pre-built template for {repo}, checking out {base_commit}...")
+                else:
+                    print(f"[reset] Cloning {repo_url} at {base_commit}...")
                 try:
                     success, output = self.sandbox_manager.clone_repo(repo_url, base_commit)
                     if not success:
-                        raise RuntimeError(f"Failed to clone repository: {output}")
-                    print(f"[reset] Clone successful")
+                        raise RuntimeError(f"Failed to setup repository: {output}")
+                    print(f"[reset] Repository setup successful")
                 except Exception as e:
-                    print(f"[reset] Clone failed: {e}")
+                    print(f"[reset] Repository setup failed: {e}")
                     raise
 
-            # Install dependencies
+            # Install dependencies (may be skipped for pre-built templates)
             install_cmd = self.entry.get("install_cmd", "pip install -e . 2>&1")
             self.sandbox_manager.install_deps(install_cmd)
 
@@ -325,9 +340,9 @@ Your response should include a patch in unified diff format starting with "diff 
         return SWEBenchPPIOEnv(
             entry=info.get("entry"),
             timeout=info.get("timeout", 3600),
-            workdir=info.get("workdir", "/home/user/testbed"),
+            workdir=info.get("workdir", DEFAULT_WORKDIR),
             use_pool=info.get("use_pool", True),
-            pool_size=info.get("pool_size", 16),
+            pool_size=info.get("pool_size", 32),
         )
 
     @staticmethod

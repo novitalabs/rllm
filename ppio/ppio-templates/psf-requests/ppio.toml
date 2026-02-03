@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (u48i83qg99fo1ew9z39c) or template name (swebench-psf-requests) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("swebench-psf-requests") # Sync sandbox
+# sandbox = await AsyncSandbox.create("swebench-psf-requests") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('swebench-psf-requests')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "swebench-psf-requests"
+template_id = "u48i83qg99fo1ew9z39c"

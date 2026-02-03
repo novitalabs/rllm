@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (rmug43u6aplunk0pv7ix) or template name (swebench-astropy-astropy) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("swebench-astropy-astropy") # Sync sandbox
+# sandbox = await AsyncSandbox.create("swebench-astropy-astropy") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('swebench-astropy-astropy')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "swebench-astropy-astropy"
+template_id = "rmug43u6aplunk0pv7ix"

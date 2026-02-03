@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (0vhf3q4gdaqgs4w34eh4) or template name (swebench-pydata-xarray) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("swebench-pydata-xarray") # Sync sandbox
+# sandbox = await AsyncSandbox.create("swebench-pydata-xarray") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('swebench-pydata-xarray')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "swebench-pydata-xarray"
+template_id = "0vhf3q4gdaqgs4w34eh4"
