@@ -118,6 +118,73 @@ def compute_grpo_advantages(rewards: List[float]) -> List[float]:
 # Training Loop
 # =============================================================================
 
+async def run_single_rollout(
+    instance: Dict,
+    rollout_idx: int,
+    model,
+    tokenizer,
+    max_steps: int = 50,
+):
+    """Run a single rollout for an instance."""
+    from rllm.environments.swe_ppio.swe_ppio import SWEBenchPPIOEnv
+    from rllm.agents.swe_agent import SWEAgent
+
+    env = SWEBenchPPIOEnv(
+        entry=instance,
+        timeout=3600,
+        workdir="/testbed",
+        use_pool=True,
+        pool_size=32,
+    )
+    agent = SWEAgent(
+        use_fn_calling=False,
+        scaffold="r2egym",
+    )
+
+    try:
+        obs, info = env.reset()
+        agent.update_from_env(obs["task_instruction"], 0, False, info)
+
+        trajectory = []
+        done = False
+        step = 0
+
+        while not done and step < max_steps:
+            messages = agent.chat_completions
+            response = await generate_response(model, tokenizer, messages)
+            action = agent.update_from_model(response)
+            obs, reward, done, info = env.step(action.action)
+            agent.update_from_env(obs, reward, done, info)
+
+            trajectory.append({
+                "action": action.action,
+                "reward": reward,
+                "done": done,
+            })
+            step += 1
+
+        final_reward = env.compute_final_reward()
+        total_reward = sum(t["reward"] for t in trajectory) + final_reward
+
+        return {
+            "reward": total_reward,
+            "trajectory": trajectory,
+            "instance_id": instance.get("instance_id", "unknown"),
+            "rollout_idx": rollout_idx,
+        }
+    except Exception as e:
+        logger.error(f"Rollout {rollout_idx} failed: {e}")
+        return {
+            "reward": 0.0,
+            "trajectory": [],
+            "instance_id": instance.get("instance_id", "unknown"),
+            "rollout_idx": rollout_idx,
+            "error": str(e),
+        }
+    finally:
+        env.close()
+
+
 async def train_batch(
     batch_idx: int,
     instances: List[Dict],
@@ -125,75 +192,55 @@ async def train_batch(
     tokenizer,
     group_size: int = 4,
     max_steps: int = 50,
+    max_concurrent: int = 8,
 ):
-    """Train on a batch of instances."""
-    from rllm.environments.swe_ppio.swe_ppio import SWEBenchPPIOEnv
-    from rllm.agents.swe_agent import SWEAgent
+    """Train on a batch of instances with parallel rollouts."""
+    from asyncio import Semaphore
 
-    batch_rewards = []
-    batch_trajectories = []
+    sem = Semaphore(max_concurrent)
 
+    async def limited_rollout(instance, idx):
+        async with sem:
+            return await run_single_rollout(instance, idx, model, tokenizer, max_steps)
+
+    # Create all rollout tasks
+    tasks = []
+    task_info = []  # (instance_id, task)
     for instance in instances:
-        # Run group rollouts for this instance
-        group_rewards = []
-        group_trajectories = []
-
+        instance_id = instance.get("instance_id", "unknown")
         for g in range(group_size):
-            # Create environment and agent
-            env = SWEBenchPPIOEnv(
-                entry=instance,
-                timeout=3600,
-                workdir="/testbed",
-                use_pool=True,
-                pool_size=32,
-            )
-            agent = SWEAgent(
-                use_fn_calling=False,
-                scaffold="r2egym",
-            )
+            task = limited_rollout(instance, g)
+            tasks.append(task)
+            task_info.append(instance_id)
 
-            # Reset environment
-            obs, info = env.reset()
-            agent.update_from_env(obs["task_instruction"], 0, False, info)
+    logger.info(f"Starting {len(tasks)} parallel rollouts (max_concurrent={max_concurrent})")
 
-            trajectory = []
-            done = False
-            step = 0
+    # Run all rollouts concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            while not done and step < max_steps:
-                # Get model response
-                messages = agent.chat_completions
-                response = await generate_response(model, tokenizer, messages)
+    # Process results
+    batch_rewards = []
+    results_by_instance = {}
 
-                # Update agent and get action
-                action = agent.update_from_model(response)
+    for i, result in enumerate(results):
+        instance_id = task_info[i]
+        if instance_id not in results_by_instance:
+            results_by_instance[instance_id] = []
 
-                # Step environment
-                obs, reward, done, info = env.step(action.action)
-                agent.update_from_env(obs, reward, done, info)
+        if isinstance(result, Exception):
+            logger.error(f"Rollout {i} exception: {result}")
+            results_by_instance[instance_id].append(0.0)
+        else:
+            results_by_instance[instance_id].append(result["reward"])
+            batch_rewards.append(result["reward"])
 
-                trajectory.append({
-                    "action": action.action,
-                    "reward": reward,
-                    "done": done,
-                })
-                step += 1
-
-            # Compute final reward
-            final_reward = env.compute_final_reward()
-            total_reward = sum(t["reward"] for t in trajectory) + final_reward
-
-            group_rewards.append(total_reward)
-            group_trajectories.append(trajectory)
-
-            # Cleanup
-            env.close()
-
-        batch_rewards.extend(group_rewards)
+    # Aggregate by instance
+    batch_trajectories = []
+    for instance_id, rewards in results_by_instance.items():
         batch_trajectories.append({
-            "instance_id": instance.get("instance_id", "unknown"),
-            "rewards": group_rewards,
-            "avg_reward": sum(group_rewards) / len(group_rewards),
+            "instance_id": instance_id,
+            "rewards": rewards,
+            "avg_reward": sum(rewards) / len(rewards) if rewards else 0.0,
         })
 
     return batch_rewards, batch_trajectories
@@ -234,6 +281,9 @@ async def main():
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
     parser.add_argument("--dry-run", action="store_true", help="Test without model loading")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85, help="GPU memory utilization")
+    parser.add_argument("--max-concurrent", type=int, default=16, help="Maximum concurrent rollouts")
     args = parser.parse_args()
 
     logger.info(f"Starting SWE-PPIO local training")
@@ -269,8 +319,8 @@ async def main():
     logger.info(f"Loading model {args.model_path}...")
     model = LLM(
         model=args.model_path,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -298,6 +348,7 @@ async def main():
                 tokenizer=tokenizer,
                 group_size=args.group_size,
                 max_steps=args.max_steps,
+                max_concurrent=args.max_concurrent,
             )
 
             # Compute metrics

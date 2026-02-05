@@ -114,7 +114,8 @@ REPO_TEMPLATE_MAP = {
 }
 
 # Default workdir for pre-built templates
-DEFAULT_WORKDIR = "/testbed"
+DEFAULT_WORKDIR = "/testbed"  # For pre-built templates
+FALLBACK_WORKDIR = "/code"   # For base template (writable directory)
 
 
 # =============================================================================
@@ -172,9 +173,11 @@ class SandboxPool:
         Get a sandbox for the given trajectory index and repo.
         Uses per-repo pools with pre-built templates when available.
         """
+        # Normalize repo name for template lookup
+        normalized_repo = normalize_repo_name(repo)
         # Determine template to use
-        template = REPO_TEMPLATE_MAP.get(repo, self._default_template)
-        using_prebuilt = repo in REPO_TEMPLATE_MAP
+        template = REPO_TEMPLATE_MAP.get(normalized_repo, self._default_template)
+        using_prebuilt = normalized_repo in REPO_TEMPLATE_MAP
 
         # Use repo-specific pool key
         pool_key = repo if repo else "_default"
@@ -299,7 +302,13 @@ class PPIOSandboxManager:
                  template: str = None, repo: str = ""):
         self.api_key = api_key
         self.timeout = timeout
-        self.workdir = workdir
+        # Auto-select workdir based on template
+        # Pre-built templates use /testbed, base template uses /code
+        normalized_repo = normalize_repo_name(repo)
+        if normalized_repo in REPO_TEMPLATE_MAP:
+            self.workdir = workdir  # /testbed for pre-built
+        else:
+            self.workdir = FALLBACK_WORKDIR  # /code for base template
         self.sandbox = None
         self.use_pool = use_pool
         self.trajectory_idx = trajectory_idx
@@ -332,7 +341,7 @@ class PPIOSandboxManager:
             # Fix permissions and git safe.directory for pre-built templates
             self.sandbox.commands.run(f"chmod -R 777 {self.workdir} 2>/dev/null || true", timeout=30)
             self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
-            self.using_prebuilt = self.repo in REPO_TEMPLATE_MAP
+            self.using_prebuilt = normalize_repo_name(self.repo) in REPO_TEMPLATE_MAP
         return self.sandbox
 
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
@@ -378,7 +387,10 @@ class PPIOSandboxManager:
 
         # Not using pre-built template: clone from scratch
         # Clean up workdir first
-        self._run_command(f"rm -rf {self.workdir}/* 2>/dev/null; mkdir -p {self.workdir}", timeout=30)
+        # Create workdir first (ensure it exists before cd)
+        self._run_command(f"mkdir -p {self.workdir}", timeout=30)
+        # Clean up any existing contents
+        self._run_command(f"rm -rf {self.workdir}/* {self.workdir}/.[!.]* 2>/dev/null || true", timeout=30)
 
         if commit and commit != "HEAD":
             # For specific commits, need full clone or fetch
@@ -740,3 +752,25 @@ diff --git a/src/click/core.py b/src/click/core.py
     print("Testing PPIO SWE-bench reward function...")
     result = swebench_ppio_reward_fn(task_info, action)
     print(f"\nResult: {result}")
+
+
+# Mapping of short repo names to full GitHub org/repo format
+REPO_NAME_MAP = {
+    "pandas": "pandas-dev/pandas",
+    "numpy": "numpy/numpy",
+    "pillow": "python-pillow/Pillow",
+    "orange3": "biolab/orange3",
+    "aiohttp": "aio-libs/aiohttp",
+    "tornado": "tornadoweb/tornado",
+    "scrapy": "scrapy/scrapy",
+    "pyramid": "Pylons/pyramid",
+    "datalad": "datalad/datalad",
+    "coveragepy": "nedbat/coveragepy",
+}
+
+
+def normalize_repo_name(repo: str) -> str:
+    """Convert short repo names to full GitHub org/repo format."""
+    if "/" in repo:
+        return repo  # Already full format
+    return REPO_NAME_MAP.get(repo, repo)

@@ -23,6 +23,7 @@ from .ppio_reward import (
     get_sandbox_pool,
     DEFAULT_WORKDIR,
     REPO_TEMPLATE_MAP,
+    normalize_repo_name,
 )
 
 
@@ -190,6 +191,8 @@ class SWEBenchPPIOEnv(BaseEnv):
             base_commit = self.entry.get("base_commit", "HEAD")
 
             if repo:
+                # Normalize short repo names to full org/repo format
+                repo = normalize_repo_name(repo)
                 repo_url = f"https://github.com/{repo}.git"
                 using_prebuilt = repo in REPO_TEMPLATE_MAP
                 if using_prebuilt:
