@@ -2,47 +2,28 @@
 set -x
 
 # =============================================================================
-# DeepSWE Training Script for 8x H200 GPUs with PPIO Sandbox
-# Model: Qwen3-32B
-# Target: Reproduce DeepSWE 42.2% Pass@1 on SWE-Bench-Verified
+# DeepSWE Training Script using SWE-Bench Verified Dataset
+# Uses pre-built templates with 100% coverage for verifying training fixes
 # =============================================================================
 
-# Find rllm directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export RLLM_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export PYTHONPATH="$RLLM_DIR:$PYTHONPATH"
 
 echo "=============================================="
-echo "DeepSWE Training - 8x H200 Configuration"
+echo "DeepSWE Training - SWE-Bench Verified"
 echo "RLLM_DIR: $RLLM_DIR"
 echo "=============================================="
 
-# -----------------------------------------------------------------------------
 # Environment Setup
-# -----------------------------------------------------------------------------
-
-# Proxy Configuration for PPIO connections
-# PPIO SDK supports socket-level HTTP CONNECT proxy via setup_proxy_tunnel()
-# Set USE_PROXY=1 and https_proxy=http://127.0.0.1:1083 if behind a proxy
 if [ "${USE_PROXY:-0}" = "1" ]; then
     echo "Using proxy: ${https_proxy:-$HTTPS_PROXY}"
 else
-    # Clear proxy for direct connections
-    unset http_proxy
-    unset https_proxy
-    unset HTTP_PROXY
-    unset HTTPS_PROXY
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 fi
 
-# Use offline mode for HuggingFace (model should be cached locally)
-# Note: Disable offline mode if tokenizer loading fails
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
-
-# WandB configuration
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
-
-# vLLM settings
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_USE_V1=1
 export FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -50,84 +31,55 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 
-# PPIO API key
+# Load PPIO API key
 if [ -z "$PPIO_API_KEY" ]; then
     if [ -f "$SCRIPT_DIR/.env" ]; then
         export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
-    elif [ -f "$RLLM_DIR/.env" ]; then
-        export $(grep -v '^#' "$RLLM_DIR/.env" | xargs)
     fi
 fi
 
 if [ -z "$PPIO_API_KEY" ]; then
-    echo "Error: PPIO_API_KEY not set. Please set it in environment or .env file."
+    echo "Error: PPIO_API_KEY not set"
     exit 1
 fi
+echo "PPIO_API_KEY: ${PPIO_API_KEY:0:10}..."
 
-echo "PPIO_API_KEY: ${PPIO_API_KEY:0:10}...${PPIO_API_KEY: -4}"
-
-# -----------------------------------------------------------------------------
-# Data Preparation
-# -----------------------------------------------------------------------------
-
-TRAIN_DATA="${RLLM_DIR}/data/swe/R2E_Gym_Subset.parquet"
+# Use SWE-Bench Verified for both training and validation
+# This has 100% template coverage with pre-cloned repos
+TRAIN_DATA="${RLLM_DIR}/data/swe/SWE_Bench_Verified.parquet"
 VAL_DATA="${RLLM_DIR}/data/swe/SWE_Bench_Verified.parquet"
 
 if [ ! -f "$TRAIN_DATA" ]; then
     echo "Training data not found: $TRAIN_DATA"
-    echo "Please run: python3 examples/swe/prepare_swe_data.py"
     exit 1
 fi
 
-# -----------------------------------------------------------------------------
-# Model Configuration
-# -----------------------------------------------------------------------------
-
 MODEL="/models/models/Qwen3-32B"
-
-# -----------------------------------------------------------------------------
-# 8x H200 GPU Configuration
-# Total VRAM: 8 x 80GB = 640GB
-# Qwen3-32B BF16: ~64GB, fits comfortably with TP=8
-# -----------------------------------------------------------------------------
-
-# GPU parallelism
 N_GPUS=8
 TENSOR_PARALLEL=8
 SEQUENCE_PARALLEL=8
 
-# Batch sizes (matching original DeepSWE)
-TRAIN_BATCH_SIZE=8
-PPO_MINI_BATCH_SIZE=8
-ROLLOUT_N=8
+# Smaller batch for faster iteration during testing
+TRAIN_BATCH_SIZE=4
+PPO_MINI_BATCH_SIZE=4
+ROLLOUT_N=4
 
-# Sequence lengths
 MAX_PROMPT_LENGTH=4096
-MAX_RESPONSE_LENGTH=32768
-
-# Memory settings (H200 has 80GB HBM3)
+MAX_RESPONSE_LENGTH=16384  # Shorter for faster testing
 GPU_MEMORY_UTILIZATION=0.7
-PPO_MAX_TOKEN_LEN_PER_GPU=32000
+PPO_MAX_TOKEN_LEN_PER_GPU=16000
 
 echo "=============================================="
-echo "Model: $MODEL"
-echo "GPUs: ${N_GPUS}x H200"
-echo "Tensor Parallel: $TENSOR_PARALLEL"
-echo "Sequence Parallel: $SEQUENCE_PARALLEL"
+echo "Training on SWE-Bench Verified (500 samples)"
 echo "Batch Size: $TRAIN_BATCH_SIZE"
-echo "Max Response Length: $MAX_RESPONSE_LENGTH"
 echo "=============================================="
-
-# -----------------------------------------------------------------------------
-# Training Launch
-# -----------------------------------------------------------------------------
 
 python3 -m rllm.trainer.verl.train_agent_ppo \
     algorithm.adv_estimator=rloo \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
-    data.val_batch_size=256 \
+    data.val_batch_size=64 \
     data.max_prompt_length=$MAX_PROMPT_LENGTH \
     data.max_response_length=$MAX_RESPONSE_LENGTH \
     data.filter_overlong_prompts=True \
@@ -166,18 +118,18 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     rllm.mask_truncated_samples=False \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
-    trainer.project_name='deepswe-8h200' \
-    trainer.experiment_name='qwen3-32b-r2e-gym' \
+    trainer.project_name='deepswe-swebench' \
+    trainer.experiment_name='qwen3-32b-verified' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
-    trainer.test_freq=10 \
+    trainer.save_freq=5 \
+    trainer.test_freq=5 \
     trainer.default_hdfs_dir=null \
-    trainer.default_local_dir=/3fsdata/data0/tengwan/checkpoints/deepswe-8h200/qwen3-32b-r2e-gym \
+    trainer.default_local_dir=/3fsdata/data0/tengwan/checkpoints/deepswe-swebench/qwen3-32b-verified \
     rllm.env.name=swe_ppio_multistep \
     rllm.agent.name=sweagent \
-    rllm.agent.max_steps=50 \
+    rllm.agent.max_steps=30 \
     rllm.agent.overlong_filter=True \
-    rllm.agent.trajectory_timeout=5400 \
-    trainer.total_epochs=200
+    rllm.agent.trajectory_timeout=3600 \
+    trainer.total_epochs=50

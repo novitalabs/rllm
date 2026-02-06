@@ -30,15 +30,32 @@ else
 fi
 
 # Check key packages
-for pkg in torch vllm rllm transformers; do
+for pkg in torch vllm rllm transformers ppio_sandbox; do
     if python3 -c "import $pkg" 2>/dev/null; then
-        VERSION=$(python3 -c "import $pkg; print($pkg.__version__)" 2>/dev/null || echo "unknown")
+        VERSION=$(python3 -c "import $pkg; print(getattr($pkg, '__version__', 'OK'))" 2>/dev/null || echo "OK")
         echo "  $pkg: $VERSION"
     else
         echo "  ERROR: $pkg not installed"
         ERRORS=$((ERRORS + 1))
     fi
 done
+
+# Check r2egym (optional but recommended)
+if python3 -c "import r2egym" 2>/dev/null; then
+    VERSION=$(python3 -c "import r2egym; print(getattr(r2egym, '__version__', 'OK'))" 2>/dev/null || echo "OK")
+    echo "  r2egym: $VERSION"
+else
+    echo "  WARNING: r2egym not installed (optional)"
+    echo "           Install: pip install git+https://github.com/agentica-project/R2E-Gym.git"
+fi
+
+# Check multi-step environment
+if python3 -c "from rllm.environments.swe_ppio.swe_ppio_multistep import SWEBenchPPIOMultiStepEnv" 2>/dev/null; then
+    echo "  SWEBenchPPIOMultiStepEnv: OK"
+else
+    echo "  ERROR: SWEBenchPPIOMultiStepEnv not available"
+    ERRORS=$((ERRORS + 1))
+fi
 
 # -----------------------------------------------------------------------------
 # Check GPU availability
@@ -82,16 +99,22 @@ if [ -n "$PPIO_API_KEY" ]; then
 
     # Test PPIO connectivity
     if python3 -c "
-from ppio_sdk import Sandbox
 import os
+# Clear proxy for PPIO
+for k in list(os.environ.keys()):
+    if 'proxy' in k.lower():
+        del os.environ[k]
 os.environ['PPIO_API_KEY'] = '$PPIO_API_KEY'
-sb = Sandbox()
-sb.close()
-print('  PPIO connectivity: OK')
+
+from ppio_sandbox.core import Sandbox
+sb = Sandbox.create(timeout=60)
+result = sb.commands.run('echo OK')
+sb.kill()
+print('  PPIO connectivity: ' + result.stdout.strip())
 " 2>/dev/null; then
         :
     else
-        echo "  WARNING: PPIO connectivity test failed"
+        echo "  WARNING: PPIO connectivity test failed (check API key or network)"
     fi
 else
     echo "  ERROR: PPIO_API_KEY not set"

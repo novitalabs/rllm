@@ -23,6 +23,7 @@ from .ppio_reward import (
     get_sandbox_pool,
     DEFAULT_WORKDIR,
     REPO_TEMPLATE_MAP,
+    normalize_repo_name,
 )
 
 
@@ -190,10 +191,13 @@ class SWEBenchPPIOEnv(BaseEnv):
             base_commit = self.entry.get("base_commit", "HEAD")
 
             if repo:
-                repo_url = f"https://github.com/{repo}.git"
-                using_prebuilt = repo in REPO_TEMPLATE_MAP
+                # Normalize R2E-Gym short names to full GitHub paths
+                full_repo = normalize_repo_name(repo)
+                repo_url = f"https://github.com/{full_repo}.git"
+                # Check both short name and full path for template mapping
+                using_prebuilt = repo in REPO_TEMPLATE_MAP or full_repo in REPO_TEMPLATE_MAP
                 if using_prebuilt:
-                    print(f"[reset] Using pre-built template for {repo}, checking out {base_commit}...")
+                    print(f"[reset] Using pre-built template for {repo} ({full_repo}), checking out {base_commit}...")
                 else:
                     print(f"[reset] Cloning {repo_url} at {base_commit}...")
                 try:
@@ -335,15 +339,35 @@ Your response should include a patch in unified diff format starting with "diff 
         pool.cleanup_all()
 
     @staticmethod
-    def from_dict(info: dict) -> "SWEBenchPPIOEnv":
-        """Create environment from dictionary."""
-        return SWEBenchPPIOEnv(
-            entry=info.get("entry"),
-            timeout=info.get("timeout", 3600),
-            workdir=info.get("workdir", DEFAULT_WORKDIR),
-            use_pool=info.get("use_pool", True),
-            pool_size=info.get("pool_size", 32),
-        )
+    def from_dict(info: dict | str) -> "SWEBenchPPIOEnv":
+        """Create environment from dictionary.
+
+        Args:
+            info: Dictionary containing task data. The entire dict will be used
+                  as 'entry', and any keys matching __init__ parameters will be
+                  extracted and passed separately.
+
+        Returns:
+            Initialized SWEBenchPPIOEnv instance
+        """
+        import inspect
+
+        if isinstance(info, str):
+            info = json.loads(info)
+
+        # Extract init params that match __init__ signature
+        sig = inspect.signature(SWEBenchPPIOEnv.__init__)
+        init_params = {}
+        for param_name, param in sig.parameters.items():
+            if param_name == "self":
+                continue
+            if param_name in info:
+                init_params[param_name] = info[param_name]
+
+        # Use entire info as entry (matches standard SWEEnv behavior)
+        init_params["entry"] = info
+
+        return SWEBenchPPIOEnv(**init_params)
 
     @staticmethod
     def is_multithread_safe() -> bool:

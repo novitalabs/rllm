@@ -6,11 +6,30 @@ This directory contains scripts for training and evaluating DeepSWE on 8x H200 G
 
 | Script | Description |
 |--------|-------------|
+| `setup_h200_env.sh` | **One-click H200 environment setup** (recommended) |
+| `setup_env.sh` | Generic environment setup script |
 | `check_env.sh` | Verify environment setup before training |
 | `train_qwen3_32b_8h200.sh` | Main training script for Qwen3-32B |
 | `eval_qwen3_32b.sh` | Evaluation script using vLLM server |
 
 ## Quick Start
+
+### 0. Setup Environment (First Time)
+
+```bash
+# Set proxy if needed
+export https_proxy=http://127.0.0.1:1083
+
+# One-click install all dependencies
+bash ppio/scripts/setup_env.sh
+```
+
+This installs:
+- verl (RL training framework)
+- rllm (main library)
+- **r2egym** (SWE-bench environment)
+- ppio_sandbox (PPIO SDK)
+- Compatible versions of vllm, flash-attn, flashinfer
 
 ### 1. Check Environment
 

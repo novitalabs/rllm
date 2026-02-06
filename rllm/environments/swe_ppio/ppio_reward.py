@@ -98,7 +98,9 @@ class TestResult:
 # Pre-built PPIO Templates for SWE-bench repos
 # =============================================================================
 # These templates have repos pre-cloned at /testbed with dependencies installed
+# Use template IDs for templates without names
 REPO_TEMPLATE_MAP = {
+    # SWE-Bench validation repos (by name)
     "pallets/flask": "swebench-pallets-flask",
     "psf/requests": "swebench-psf-requests",
     "pytest-dev/pytest": "swebench-pytest-dev-pytest",
@@ -111,10 +113,46 @@ REPO_TEMPLATE_MAP = {
     "astropy/astropy": "swebench-astropy-astropy",
     "pydata/xarray": "swebench-pydata-xarray",
     "mwaskom/seaborn": "swebench-mwaskom-seaborn",
+    # R2E-Gym training repos (by template ID)
+    # r2e-gym-pillow - smaller template with Pillow pre-installed
+    "pillow": "f62brfz8qc6cjsz96kpz",
+    "python-pillow/Pillow": "f62brfz8qc6cjsz96kpz",
+    # r2e-gym-orange3-v3 - Orange3 with pre-compiled C extensions
+    "orange3": "zmaw00bm1kxnfktz4xbq",
+    "biolab/orange3": "zmaw00bm1kxnfktz4xbq",
 }
 
-# Default workdir for pre-built templates
+# Default workdir for pre-built templates (these have /testbed created with proper permissions)
 DEFAULT_WORKDIR = "/testbed"
+# Fallback workdir for base template (non-prebuilt) - uses /tmp which is writable
+FALLBACK_WORKDIR = "/tmp/testbed"
+
+# =============================================================================
+# R2E-Gym Short Name to Full GitHub Path Mapping
+# =============================================================================
+# R2E-Gym training data uses short repo names (e.g., "pandas") instead of
+# full GitHub paths (e.g., "pandas-dev/pandas"). This mapping converts them.
+R2E_GYM_REPO_MAP = {
+    "pandas": "pandas-dev/pandas",
+    "numpy": "numpy/numpy",
+    "pillow": "python-pillow/Pillow",
+    "orange3": "biolab/orange3",
+    "aiohttp": "aio-libs/aiohttp",
+    "tornado": "tornadoweb/tornado",
+    "scrapy": "scrapy/scrapy",
+    "pyramid": "Pylons/pyramid",
+    "datalad": "datalad/datalad",
+    "coveragepy": "nedbat/coveragepy",
+}
+
+
+def normalize_repo_name(repo: str) -> str:
+    """Convert R2E-Gym short repo name to full GitHub path if needed."""
+    if "/" in repo:
+        # Already a full path like "pandas-dev/pandas"
+        return repo
+    # Try R2E-Gym mapping
+    return R2E_GYM_REPO_MAP.get(repo, repo)
 
 
 # =============================================================================
@@ -172,11 +210,14 @@ class SandboxPool:
         Get a sandbox for the given trajectory index and repo.
         Uses per-repo pools with pre-built templates when available.
         """
-        # Determine template to use
-        template = REPO_TEMPLATE_MAP.get(repo, self._default_template)
-        using_prebuilt = repo in REPO_TEMPLATE_MAP
+        # Normalize R2E-Gym short names to full GitHub paths
+        full_repo = normalize_repo_name(repo)
 
-        # Use repo-specific pool key
+        # Determine template to use (check both short and full name)
+        template = REPO_TEMPLATE_MAP.get(repo) or REPO_TEMPLATE_MAP.get(full_repo) or self._default_template
+        using_prebuilt = repo in REPO_TEMPLATE_MAP or full_repo in REPO_TEMPLATE_MAP
+
+        # Use repo-specific pool key (use original name for consistency)
         pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
 
@@ -306,8 +347,10 @@ class PPIOSandboxManager:
         self.pool_size = pool_size
         self.repo = repo
         self.using_prebuilt = False  # Will be set when sandbox is created
+        # Normalize R2E-Gym short names for template lookup
+        full_repo = normalize_repo_name(repo)
         # Template: can be "base", repo-specific template, etc.
-        self.template = template or REPO_TEMPLATE_MAP.get(repo) or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
+        self.template = template or REPO_TEMPLATE_MAP.get(repo) or REPO_TEMPLATE_MAP.get(full_repo) or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
         # Configure pool if using it
         if use_pool:
@@ -332,7 +375,15 @@ class PPIOSandboxManager:
             # Fix permissions and git safe.directory for pre-built templates
             self.sandbox.commands.run(f"chmod -R 777 {self.workdir} 2>/dev/null || true", timeout=30)
             self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
-            self.using_prebuilt = self.repo in REPO_TEMPLATE_MAP
+            full_repo = normalize_repo_name(self.repo)
+            self.using_prebuilt = self.repo in REPO_TEMPLATE_MAP or full_repo in REPO_TEMPLATE_MAP
+
+        # If not using pre-built template, switch to fallback workdir (writable by non-root)
+        if not self.using_prebuilt:
+            self.workdir = FALLBACK_WORKDIR
+            print(f"[PPIOSandboxManager] Using fallback workdir: {self.workdir}")
+            self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
+
         return self.sandbox
 
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
@@ -343,6 +394,10 @@ class PPIOSandboxManager:
         except Exception as e:
             # CommandExitException includes exit code and error in message
             error_str = str(e)
+            # Try to extract stderr from exception if it has it
+            stderr = getattr(e, 'stderr', '') or getattr(e, 'error', '') or ''
+            if stderr:
+                error_str = f"{error_str}\nstderr: {stderr}"
             # Extract exit code if present
             if "exit code" in error_str.lower():
                 return 1, error_str
@@ -377,12 +432,24 @@ class PPIOSandboxManager:
             return True, "Success (pre-built template)"
 
         # Not using pre-built template: clone from scratch
-        # Clean up workdir first
-        self._run_command(f"rm -rf {self.workdir}/* 2>/dev/null; mkdir -p {self.workdir}", timeout=30)
+        # Ensure workdir exists and clean it (must succeed before proceeding)
+        # Remove directory completely and recreate to ensure clean state for git clone
+        mkdir_cmd = f"rm -rf {self.workdir} 2>/dev/null; mkdir -p {self.workdir} && chmod 777 {self.workdir}"
+        exit_code, output = self._run_command(mkdir_cmd, timeout=30)
+        print(f"[PPIOSandboxManager] mkdir result: exit_code={exit_code}, output={output}")
+        if exit_code != 0:
+            return False, f"Failed to create workdir: {output}"
+
+        # Check if git is available
+        git_check_code, git_version = self._run_command("git --version 2>&1", timeout=10)
+        print(f"[PPIOSandboxManager] Git check: exit_code={git_check_code}, output={git_version}")
+        if git_check_code != 0:
+            return False, f"Git not available: {git_version}"
 
         if commit and commit != "HEAD":
             # For specific commits, need full clone or fetch
-            cmd = f"cd {self.workdir} && git clone {repo_url} . 2>&1"
+            # Use GIT_CURL_VERBOSE and GIT_TRACE for debugging
+            cmd = f"cd {self.workdir} && GIT_TRACE=1 git clone {repo_url} . 2>&1"
             exit_code, output = self._run_command(cmd, timeout=300)
             if exit_code != 0:
                 return False, f"Clone failed (exit={exit_code}): {output}"
