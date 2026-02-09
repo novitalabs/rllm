@@ -34,6 +34,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Rollout timeout to prevent hanging (45 min, safe within 1-hour sandbox limit)
+ROLLOUT_TIMEOUT = 2700
+
+
 
 # =============================================================================
 # Checkpoint Manager (from rft-tinker v3)
@@ -142,7 +146,7 @@ async def run_single_rollout(
     )
 
     try:
-        obs, info = env.reset()
+        obs, info = await asyncio.to_thread(env.reset)
         agent.update_from_env(obs["task_instruction"], 0, False, info)
 
         trajectory = []
@@ -153,7 +157,8 @@ async def run_single_rollout(
             messages = agent.chat_completions
             response = await generate_response(model, tokenizer, messages)
             action = agent.update_from_model(response)
-            obs, reward, done, info = env.step(action.action)
+            logger.info(f"Model action (first 500 chars): {action.action[:500] if len(action.action) > 500 else action.action}")
+            obs, reward, done, info = await asyncio.to_thread(env.step, action.action)
             agent.update_from_env(obs, reward, done, info)
 
             trajectory.append({
@@ -201,7 +206,21 @@ async def train_batch(
 
     async def limited_rollout(instance, idx):
         async with sem:
-            return await run_single_rollout(instance, idx, model, tokenizer, max_steps)
+            try:
+                return await asyncio.wait_for(
+                    run_single_rollout(instance, idx, model, tokenizer, max_steps),
+                    timeout=ROLLOUT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                instance_id = instance.get("instance_id", "unknown")
+                logger.error(f"Rollout {idx} for {instance_id} timed out after {ROLLOUT_TIMEOUT}s")
+                return {
+                    "reward": 0.0,
+                    "trajectory": [],
+                    "instance_id": instance_id,
+                    "rollout_idx": idx,
+                    "error": f"Timeout after {ROLLOUT_TIMEOUT}s",
+                }
 
     # Create all rollout tasks
     tasks = []
@@ -246,8 +265,50 @@ async def train_batch(
     return batch_rewards, batch_trajectories
 
 
+def truncate_context(tokenizer, messages, max_tokens=60000):
+    """Truncate messages to fit within max_tokens, keeping system prompt and recent messages."""
+    if not messages:
+        return messages
+    
+    # Always keep system prompt if present
+    system_messages = []
+    other_messages = []
+    for msg in messages:
+        if msg.get('role') == 'system':
+            system_messages.append(msg)
+        else:
+            other_messages.append(msg)
+    
+    # Count tokens for full context
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    full_tokens = len(tokenizer.encode(full_text))
+    
+    logger.info(f"Context size: {full_tokens} tokens")
+    if full_tokens <= max_tokens:
+        return messages
+    
+    logger.warning(f'Context too long ({full_tokens} tokens), truncating to {max_tokens}')
+    
+    # Keep as many recent messages as possible
+    kept_messages = []
+    for msg in reversed(other_messages):
+        test_messages = system_messages + [msg] + kept_messages
+        test_text = tokenizer.apply_chat_template(test_messages, tokenize=False, add_generation_prompt=True)
+        if len(tokenizer.encode(test_text)) <= max_tokens:
+            kept_messages.insert(0, msg)
+        else:
+            break
+    
+    result = system_messages + kept_messages
+    logger.info(f'Truncated context from {len(messages)} to {len(result)} messages')
+    return result
+
+
 async def generate_response(model, tokenizer, messages):
     """Generate model response using vLLM."""
+    # Truncate context if too long
+    messages = truncate_context(tokenizer, messages, max_tokens=60000)
+    
     # Format messages into prompt
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -259,7 +320,7 @@ async def generate_response(model, tokenizer, messages):
         stop=["</function>"],
     )
 
-    outputs = model.generate([prompt], sampling_params)
+    outputs = await asyncio.to_thread(model.generate, [prompt], sampling_params)
     response = outputs[0].outputs[0].text
 
     # Add back stop string if present in action

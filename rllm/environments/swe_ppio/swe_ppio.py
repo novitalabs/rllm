@@ -30,6 +30,205 @@ from .ppio_reward import (
 # Setup proxy
 setup_proxy_tunnel()
 
+# XML Action Parser and Handlers for SWE-bench Environment
+
+import re
+import json
+from dataclasses import dataclass, field
+from typing import Dict, Any, Tuple, Optional
+
+
+@dataclass
+class XMLAction:
+    """Parsed XML function call action."""
+    function_name: str = ""
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    raw_action: str = ""
+
+    @classmethod
+    def from_string(cls, action_str: str) -> "XMLAction":
+        """Parse XML-format action string like <function=name>params</function>"""
+        if not action_str:
+            return cls(raw_action=action_str)
+
+        # Parse <function=name>...</function>
+        pattern = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
+        match = pattern.search(action_str)
+
+        if match:
+            function_name = match.group(1).strip()
+            params_str = match.group(2).strip()
+
+            # Parse <parameter=key>value</parameter>
+            parameters = {}
+            param_pattern = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+            for m in param_pattern.finditer(params_str):
+                key = m.group(1).strip()
+                value = m.group(2).strip()
+                parameters[key] = value
+
+            return cls(function_name=function_name, parameters=parameters, raw_action=action_str)
+
+        return cls(raw_action=action_str)
+
+
+def handle_execute_bash(sandbox_manager, params: Dict[str, Any], workdir: str) -> Tuple[str, int]:
+    """Handle execute_bash action."""
+    cmd = params.get("cmd", params.get("command", ""))
+    if not cmd:
+        return "Error: No command provided", 1
+
+    # Execute in workdir
+    full_cmd = f"cd {workdir} && {cmd}"
+    exit_code, output = sandbox_manager.run_command(full_cmd, timeout=120)
+    return output, exit_code
+
+
+def handle_file_editor(sandbox_manager, params: Dict[str, Any], workdir: str) -> Tuple[str, int]:
+    """Handle file_editor action (view, create, str_replace, insert, undo_edit)."""
+    command = params.get("command", "")
+    path = params.get("path", "")
+
+    if not path:
+        return "Error: No path provided", 1
+
+    # Make path absolute if relative
+    if not path.startswith("/"):
+        path = f"{workdir}/{path}"
+
+    if command == "view":
+        view_range = params.get("view_range", "")
+        concise = params.get("concise", "true").lower() == "true"
+
+        if view_range:
+            # Parse range like [11, 20] or 11,20
+            try:
+                if "[" in view_range:
+                    range_str = view_range.strip("[]")
+                else:
+                    range_str = view_range
+                parts = [int(x.strip()) for x in range_str.split(",")]
+                if len(parts) == 2:
+                    start, end = parts
+                    if end == -1:
+                        cmd = f"sed -n '{start},' {path}"
+                    else:
+                        cmd = f"sed -n '{start},{end}p' {path}"
+                else:
+                    cmd = f"cat -n {path}"
+            except:
+                cmd = f"cat -n {path}"
+        else:
+            cmd = f"cat -n {path}"
+
+        exit_code, output = sandbox_manager.run_command(cmd, timeout=30)
+        return output, exit_code
+
+    elif command == "create":
+        file_text = params.get("file_text", "")
+        # Escape for bash
+        escaped_text = file_text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\$")
+        cmd = f'mkdir -p "." && echo "{escaped_text}" > {path}'
+        exit_code, output = sandbox_manager.run_command(cmd, timeout=30)
+        if exit_code == 0:
+            return f"File created at {path}", 0
+        return output, exit_code
+
+    elif command == "str_replace":
+        old_str = params.get("old_str", "")
+        new_str = params.get("new_str", "")
+
+        if not old_str:
+            return "Error: old_str is required for str_replace", 1
+
+        # Read file, do replacement, write back
+        exit_code, content = sandbox_manager.run_command(f"cat {path}", timeout=30)
+        if exit_code != 0:
+            return f"Error reading file: {content}", exit_code
+
+        # Check if old_str exists
+        if old_str not in content:
+            return f"Error: old_str not found in {path}. Make sure it matches exactly including whitespace.", 1
+
+        # Count occurrences
+        count = content.count(old_str)
+        if count > 1:
+            return f"Error: old_str appears {count} times in {path}. Please make it unique by including more context.", 1
+
+        # Do replacement
+        new_content = content.replace(old_str, new_str, 1)
+
+        # Write back using heredoc
+        cmd = f"cat > {path} << 'HEREDOC_END'\n{new_content}\nHEREDOC_END"
+        exit_code, output = sandbox_manager.run_command(cmd, timeout=60)
+        if exit_code == 0:
+            return f"Successfully replaced text in {path}", 0
+        return output, exit_code
+
+    elif command == "insert":
+        new_str = params.get("new_str", "")
+        insert_line = params.get("insert_line", "")
+
+        if not new_str or not insert_line:
+            return "Error: new_str and insert_line are required for insert", 1
+
+        try:
+            line_num = int(insert_line)
+        except:
+            return f"Error: invalid insert_line: {insert_line}", 1
+
+        # Use sed to insert after line
+        escaped_new = new_str.replace("\\", "\\\\").replace("/", "\/")
+        cmd = f"sed -i '{line_num}a\{escaped_new}' {path}"
+        exit_code, output = sandbox_manager.run_command(cmd, timeout=30)
+        if exit_code == 0:
+            return f"Successfully inserted text after line {line_num} in {path}", 0
+        return output, exit_code
+
+    elif command == "undo_edit":
+        # Use git checkout to undo changes to file
+        cmd = f"cd {workdir} && git checkout -- {path}"
+        exit_code, output = sandbox_manager.run_command(cmd, timeout=30)
+        if exit_code == 0:
+            return f"Successfully reverted {path}", 0
+        return output, exit_code
+
+    else:
+        return f"Unknown file_editor command: {command}", 1
+
+
+def handle_search(sandbox_manager, params: Dict[str, Any], workdir: str) -> Tuple[str, int]:
+    """Handle search action."""
+    search_term = params.get("search_term", "")
+    path = params.get("path", ".")
+
+    if not search_term:
+        return "Error: search_term is required", 1
+
+    # Make path absolute if relative
+    if not path.startswith("/"):
+        path = f"{workdir}/{path}"
+
+    # Use grep for search
+    cmd = f"grep -rn '{search_term}' {path} | head -100"
+    exit_code, output = sandbox_manager.run_command(cmd, timeout=60)
+
+    if exit_code == 1 and not output.strip():
+        return f"No matches found for '{search_term}' in {path}", 0
+
+    return output, 0
+
+
+def is_xml_action(action: str) -> bool:
+    """Check if action contains XML function call."""
+    return "<function=" in action and "</function>" in action
+
+
+def is_submit_action(action: XMLAction) -> bool:
+    """Check if action is a submit/finish action."""
+    return action.function_name.lower() in ("finish", "submit")
+
+
 
 # Hardcoded test commands for common repos (from SWE-bench harness)
 REPO_TEST_CMDS = {
@@ -236,36 +435,76 @@ Your response should include a patch in unified diff format starting with "diff 
     def step(self, action: str) -> tuple[str, float, bool, dict]:
         """Execute an action in the environment.
 
-        For SWE-bench, the action is typically a patch that gets applied and tested.
+        Supports both:
+        1. XML function calls: <function=name>params</function>
+        2. Direct diff patches: diff --git...
 
         Args:
-            action: The model's response containing a patch
+            action: The model's response containing action or patch
 
         Returns:
             Tuple of (observation, reward, done, info)
         """
         self.total_steps += 1
 
-        # Extract patch from action
+        # Check if this is an XML function call
+        if is_xml_action(action):
+            parsed = XMLAction.from_string(action)
+
+            if is_submit_action(parsed):
+                # Submit action - run tests and calculate reward
+                return self._handle_submit()
+
+            elif parsed.function_name == "execute_bash":
+                output, exit_code = handle_execute_bash(
+                    self.sandbox_manager, parsed.parameters, self.workdir
+                )
+                return output, 0.0, False, {"action_type": "execute_bash", "exit_code": exit_code}
+
+            elif parsed.function_name in ("file_editor", "str_replace_editor"):
+                output, exit_code = handle_file_editor(
+                    self.sandbox_manager, parsed.parameters, self.workdir
+                )
+                return output, 0.0, False, {"action_type": "file_editor", "exit_code": exit_code}
+
+            elif parsed.function_name == "search":
+                output, exit_code = handle_search(
+                    self.sandbox_manager, parsed.parameters, self.workdir
+                )
+                return output, 0.0, False, {"action_type": "search", "exit_code": exit_code}
+
+            else:
+                # Unknown function - try as bash command
+                output, exit_code = handle_execute_bash(
+                    self.sandbox_manager, {"cmd": action}, self.workdir
+                )
+                return output, 0.0, False, {"action_type": "unknown", "exit_code": exit_code}
+
+        # Legacy: Check for direct diff patch
         patch = extract_patch_from_response(action)
-        if not patch:
-            return "No valid patch found in response.", 0.0, False, {
-                "error": "No patch found"
-            }
+        if patch:
+            # Apply patch directly and run tests
+            success, output = self.sandbox_manager.apply_patch(patch)
+            if not success:
+                return f"Failed to apply patch: {output}", 0.0, False, {
+                    "error": "Patch application failed",
+                    "output": output[:500]
+                }
+            # Patch applied, now run tests
+            return self._handle_submit()
 
-        # Apply patch
-        success, output = self.sandbox_manager.apply_patch(patch)
-        if not success:
-            return f"Failed to apply patch: {output}", 0.0, False, {
-                "error": "Patch application failed",
-                "output": output[:500]
-            }
+        # No valid action found
+        return "No valid action found in response. Use <function=name>params</function> format.", 0.0, False, {
+            "error": "No valid action"
+        }
 
-        # Run tests
+    def _handle_submit(self) -> tuple[str, float, bool, dict]:
+        """Handle submit action - run tests and calculate reward."""
+        # Get test configuration
         fail_to_pass = self.entry.get("FAIL_TO_PASS", []) if self.entry else []
         pass_to_pass = self.entry.get("PASS_TO_PASS", []) if self.entry else []
 
-        # Parse JSON strings if needed (some datasets store as string)
+        # Parse JSON strings if needed
         fail_to_pass = parse_fail_to_pass(fail_to_pass)
         pass_to_pass = parse_fail_to_pass(pass_to_pass)
 
@@ -297,7 +536,7 @@ Your response should include a patch in unified diff format starting with "diff 
         else:
             reward = 0.0
 
-        # Environment is done after one patch attempt
+        # Episode is done after submit
         done = True
 
         observation = f"""Test Results:
@@ -316,9 +555,11 @@ Your response should include a patch in unified diff format starting with "diff 
             "p2p_failure": result.p2p_failure,
             "test_passed": result.passed,
             "test_failed": result.failed,
+            "reward": reward,
         }
 
         return observation, reward, done, info
+
 
     def compute_final_reward(self) -> float:
         """Compute the final reward for the episode."""

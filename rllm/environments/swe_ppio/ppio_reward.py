@@ -344,6 +344,10 @@ class PPIOSandboxManager:
             self.using_prebuilt = normalize_repo_name(self.repo) in REPO_TEMPLATE_MAP
         return self.sandbox
 
+    def run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
+        """Public wrapper for running commands in sandbox"""
+        return self._run_command(cmd, timeout)
+
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
         """Run command and return (exit_code, output), catching exceptions"""
         try:
