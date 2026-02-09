@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (c4akfzxyrlidj0bf62jp) or template name (r2e-numpy) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("r2e-numpy") # Sync sandbox
+# sandbox = await AsyncSandbox.create("r2e-numpy") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('r2e-numpy')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "r2e-numpy"
+template_id = "c4akfzxyrlidj0bf62jp"

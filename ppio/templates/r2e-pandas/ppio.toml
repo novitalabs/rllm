@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (6c8xaocax81qrezekhr8) or template name (r2e-pandas) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("r2e-pandas") # Sync sandbox
+# sandbox = await AsyncSandbox.create("r2e-pandas") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('r2e-pandas')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "r2e-pandas"
+template_id = "6c8xaocax81qrezekhr8"

@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (bjjxy1vr3y5hmh3j6vir) or template name (r2e-scrapy) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("r2e-scrapy") # Sync sandbox
+# sandbox = await AsyncSandbox.create("r2e-scrapy") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('r2e-scrapy')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "r2e-scrapy"
+template_id = "bjjxy1vr3y5hmh3j6vir"

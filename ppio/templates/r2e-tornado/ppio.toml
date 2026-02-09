@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (51lvfnc2ir0hkfhor85u) or template name (r2e-tornado) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("r2e-tornado") # Sync sandbox
+# sandbox = await AsyncSandbox.create("r2e-tornado") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('r2e-tornado')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "r2e-tornado"
+template_id = "51lvfnc2ir0hkfhor85u"

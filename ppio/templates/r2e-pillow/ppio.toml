@@ -1,0 +1,15 @@
+# This is a config for PPIO Sandbox template.
+# You can use template ID (0x6x6b0gdv3fyf6413hn) or template name (r2e-pillow) to create a sandbox:
+
+# Python SDK
+# from ppio_sandbox.core import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("r2e-pillow") # Sync sandbox
+# sandbox = await AsyncSandbox.create("r2e-pillow") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'ppio-sandbox'
+# const sandbox = await Sandbox.create('r2e-pillow')
+
+dockerfile = "ppio.Dockerfile"
+template_name = "r2e-pillow"
+template_id = "0x6x6b0gdv3fyf6413hn"

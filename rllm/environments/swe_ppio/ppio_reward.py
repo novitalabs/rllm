@@ -113,13 +113,27 @@ REPO_TEMPLATE_MAP = {
     "astropy/astropy": "swebench-astropy-astropy",
     "pydata/xarray": "swebench-pydata-xarray",
     "mwaskom/seaborn": "swebench-mwaskom-seaborn",
-    # R2E-Gym training repos (by template ID)
-    # r2e-gym-pillow - smaller template with Pillow pre-installed
-    "pillow": "f62brfz8qc6cjsz96kpz",
-    "python-pillow/Pillow": "f62brfz8qc6cjsz96kpz",
-    # r2e-gym-orange3-v3 - Orange3 with pre-compiled C extensions
-    "orange3": "zmaw00bm1kxnfktz4xbq",
-    "biolab/orange3": "zmaw00bm1kxnfktz4xbq",
+    # R2E-Gym training repos (short name + full GitHub path)
+    "pandas": "r2e-pandas",
+    "pandas-dev/pandas": "r2e-pandas",
+    "numpy": "r2e-numpy",
+    "numpy/numpy": "r2e-numpy",
+    "pillow": "r2e-pillow",
+    "python-pillow/Pillow": "r2e-pillow",
+    "orange3": "r2e-orange3",
+    "biolab/orange3": "r2e-orange3",
+    "aiohttp": "r2e-aiohttp-v2",
+    "aio-libs/aiohttp": "r2e-aiohttp-v2",
+    "tornado": "r2e-tornado",
+    "tornadoweb/tornado": "r2e-tornado",
+    "scrapy": "r2e-scrapy",
+    "scrapy/scrapy": "r2e-scrapy",
+    "pyramid": "r2e-pyramid",
+    "Pylons/pyramid": "r2e-pyramid",
+    "datalad": "r2e-datalad-v2",
+    "datalad/datalad": "r2e-datalad-v2",
+    "coveragepy": "r2e-coveragepy",
+    "nedbat/coveragepy": "r2e-coveragepy",
 }
 
 # Default workdir for pre-built templates (these have /testbed created with proper permissions)
