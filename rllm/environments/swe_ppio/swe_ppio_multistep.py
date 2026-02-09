@@ -9,6 +9,7 @@ and executes commands in PPIO sandbox instead of Docker.
 import json
 import os
 import re
+import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,34 @@ def parse_xml_action(response_text: str) -> tuple[str, ParsedAction]:
     action = ParsedAction.from_string(action_str)
 
     return thought, action
+
+
+# =============================================================================
+# Sandbox File I/O with Retry
+# =============================================================================
+def _sandbox_file_write(sandbox, path: str, content: str, max_retries: int = 3):
+    """Write file to sandbox with retry on 500 errors."""
+    for attempt in range(max_retries):
+        try:
+            sandbox.files.write(path, content)
+            return
+        except Exception as e:
+            if attempt < max_retries - 1 and "500" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+
+def _sandbox_file_read(sandbox, path: str, max_retries: int = 3) -> str:
+    """Read file from sandbox with retry on 500 errors."""
+    for attempt in range(max_retries):
+        try:
+            return sandbox.files.read(path)
+        except Exception as e:
+            if attempt < max_retries - 1 and "500" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 # =============================================================================
@@ -494,7 +523,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Write file
         try:
-            self.sandbox_manager.sandbox.files.write(path, file_text)
+            _sandbox_file_write(self.sandbox_manager.sandbox, path, file_text)
             # Track file state
             self.file_states[path] = FileState(content=file_text, history=[])
             return f"File created successfully at: {path}", 0.0, False, {}
@@ -511,7 +540,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Read current file content
         try:
-            content = self.sandbox_manager.sandbox.files.read(path)
+            content = _sandbox_file_read(self.sandbox_manager.sandbox, path)
         except Exception as e:
             return f"Error reading {path}: {str(e)}", 0.0, False, {"error": str(e)}
 
@@ -536,7 +565,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Write back
         try:
-            self.sandbox_manager.sandbox.files.write(path, new_content)
+            _sandbox_file_write(self.sandbox_manager.sandbox, path, new_content)
             self.file_states[path].content = new_content
             return f"Successfully replaced text in {path}.", 0.0, False, {}
         except Exception as e:
@@ -559,7 +588,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Read current file content
         try:
-            content = self.sandbox_manager.sandbox.files.read(path)
+            content = _sandbox_file_read(self.sandbox_manager.sandbox, path)
         except Exception as e:
             return f"Error reading {path}: {str(e)}", 0.0, False, {"error": str(e)}
 
@@ -580,7 +609,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Write back
         try:
-            self.sandbox_manager.sandbox.files.write(path, new_content)
+            _sandbox_file_write(self.sandbox_manager.sandbox, path, new_content)
             self.file_states[path].content = new_content
             return f"Successfully inserted text at line {insert_line} in {path}.", 0.0, False, {}
         except Exception as e:
@@ -596,7 +625,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         # Write back
         try:
-            self.sandbox_manager.sandbox.files.write(path, previous_content)
+            _sandbox_file_write(self.sandbox_manager.sandbox, path, previous_content)
             self.file_states[path].content = previous_content
             return f"Successfully reverted {path} to previous state.", 0.0, False, {}
         except Exception as e:

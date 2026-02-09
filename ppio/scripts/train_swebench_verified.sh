@@ -64,10 +64,10 @@ TRAIN_BATCH_SIZE=4
 PPO_MINI_BATCH_SIZE=4
 ROLLOUT_N=4
 
-MAX_PROMPT_LENGTH=4096
-MAX_RESPONSE_LENGTH=16384  # Shorter for faster testing
+MAX_PROMPT_LENGTH=8192     # Increased: some SWE-Bench samples have prompts > 4096 tokens
+MAX_RESPONSE_LENGTH=32768  # Increased to match DeepSWE paper settings
 GPU_MEMORY_UTILIZATION=0.7
-PPO_MAX_TOKEN_LEN_PER_GPU=16000
+PPO_MAX_TOKEN_LEN_PER_GPU=32000  # Match max_response_length
 
 echo "=============================================="
 echo "Training on SWE-Bench Verified (500 samples)"

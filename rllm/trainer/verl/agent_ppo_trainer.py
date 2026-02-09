@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import math
 import os
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
@@ -28,6 +30,8 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
+
+logger = logging.getLogger(__name__)
 
 
 class AgentPPOTrainer(RayPPOTrainer):
@@ -750,12 +754,17 @@ class AgentPPOTrainer(RayPPOTrainer):
         queue = Queue()
 
         def runner():
-            async def consume():
-                async for item in self.agent_execution_engine.trajectory_generator(timing_raw=timing_raw, mode=mode, meta_info=meta_info):
-                    queue.put(item)
-                queue.put(None)  # sentinel to signal done
+            try:
+                async def consume():
+                    async for item in self.agent_execution_engine.trajectory_generator(timing_raw=timing_raw, mode=mode, meta_info=meta_info):
+                        queue.put(item)
+                    queue.put(None)  # sentinel to signal done
 
-            asyncio.run(consume())
+                asyncio.run(consume())
+            except Exception as e:
+                logger.error(f"Runner thread crashed: {e}")
+                traceback.print_exc()
+                queue.put(None)  # ensure sentinel is sent to unblock main thread
 
         Thread(target=runner, daemon=True).start()
         while True:
@@ -768,7 +777,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         from verl.utils.torch_functional import pad_sequence_to_length
 
         overlong_filter = self.config.rllm.agent.get("overlong_filter", False)
-        overlong_reasons = {"TRUNCATION", "MAX_STEPS", "TIMEOUT"}
+        overlong_reasons = {"TRUNCATION", "MAX_STEPS", "TIMEOUT", "PROMPT_OVERLONG", "ERROR"}
 
         all_prompts_list = []
         all_responses_list = []
@@ -789,6 +798,11 @@ class AgentPPOTrainer(RayPPOTrainer):
             training_reward = episode["trajectory_reward"]
             mc_returns = episode["mc_returns"]
             termination_reason = episode.get("termination_reason")
+
+            # Skip empty episodes (e.g., prompt too long)
+            if not episode_steps:
+                logger.warning(f"Skipping empty episode idx={idx} (termination_reason={termination_reason})")
+                continue
 
             # Mask out overlong trajectories
             masked_out = overlong_filter and termination_reason in overlong_reasons

@@ -215,12 +215,14 @@ class AgentExecutionEngine:
         messages = agent.chat_completions
         prompt_tokens, _ = convert_messages_to_tokens_and_masks(messages, tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=True, contains_generation_msg=True)
         prompt_token_len = len(prompt_tokens)
-        # Note, this should never happen!
+        # Handle prompt too long by returning a masked empty trajectory instead of crashing
         if prompt_token_len > self.max_prompt_length:
-            agent.reset()
-            raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
+            logger.warning(f"Trajectory {idx}: initial prompt length {prompt_token_len} exceeded max_prompt_length {self.max_prompt_length}, returning masked empty trajectory")
+            termination_reason = "PROMPT_OVERLONG"
 
         for step_idx in range(self.max_steps):
+            if termination_reason:
+                break
             # Get action from agent
             prompt_messages = agent.chat_completions.copy()
             # Max remaining tokens left for the response
@@ -358,7 +360,7 @@ class AgentExecutionEngine:
 
         masked_out = False
         if self.overlong_filter:
-            if termination_reason == "TRUNCATION" or termination_reason == "MAX_STEPS" or termination_reason == "TIMEOUT":
+            if termination_reason in ("TRUNCATION", "MAX_STEPS", "TIMEOUT", "PROMPT_OVERLONG"):
                 # Mask out the entire response for overlong trajectories if the reward is 0.
                 response_masks = [0] * len(response_masks)
                 masked_out = True
@@ -391,7 +393,14 @@ class AgentExecutionEngine:
         if mode == "Text":
             return trajectory
         elif mode == "Token":
-            prompt_tokens, response_tokens, response_masks, is_valid_trajectory = self.assemble_steps(episode_steps)
+            if episode_steps:
+                prompt_tokens, response_tokens, response_masks, is_valid_trajectory = self.assemble_steps(episode_steps)
+            else:
+                # No steps taken (e.g., prompt too long) - create valid masked dummy trajectory
+                prompt_tokens = torch.tensor(prompt_tokens[:self.max_prompt_length], dtype=torch.long)
+                response_tokens = torch.tensor([self.tokenizer.pad_token_id or 0], dtype=torch.long)
+                response_masks = torch.tensor([0], dtype=torch.long)
+                is_valid_trajectory = False
             token_result = {
                 "prompt_tokens": prompt_tokens,
                 "response_tokens": response_tokens,
@@ -526,10 +535,37 @@ class AgentExecutionEngine:
                         **kwargs,
                     )
                 except Exception as e:
-                    import traceback
-
                     traceback.print_exc()
-                    raise e
+                    logger.error(f"Trajectory {env_idx} permanently failed: {e}, returning dummy result")
+                    # Return dummy result to maintain batch size consistency
+                    pad_id = self.tokenizer.pad_token_id or 0
+                    if mode == "Token":
+                        result = {
+                            "prompt_tokens": torch.tensor([pad_id], dtype=torch.long),
+                            "response_tokens": torch.tensor([pad_id], dtype=torch.long),
+                            "response_masks": torch.tensor([0], dtype=torch.long),
+                            "trajectory_reward": 0.0,
+                            "idx": env_idx,
+                            "chat_completions": [],
+                            "metrics": {
+                                "steps": 0,
+                                "reward_time": None,
+                                "env_time": 0.0,
+                                "llm_time": 0.0,
+                                "total_time": 0.0,
+                                "token_mismatch": 1.0,
+                            },
+                        }
+                    elif mode == "Step":
+                        result = {
+                            "steps": [],
+                            "trajectory_reward": 0.0,
+                            "idx": env_idx,
+                            "mc_returns": [],
+                            "termination_reason": "ERROR",
+                        }
+                    else:
+                        raise
                 return result
 
         # Create all N conceptual tasks. Their execution will be throttled by the semaphore
@@ -544,7 +580,10 @@ class AgentExecutionEngine:
                 colorful_print(f"Number of Trajectories {tasks_completed}/{len(self.envs)} completed", "cyan")
                 yield result
             except Exception as e:
-                raise e
+                tasks_completed += 1
+                logger.error(f"Trajectory failed ({tasks_completed}/{len(self.envs)}): {e}")
+                traceback.print_exc()
+                continue
 
         if self.engine_name == "verl":
             await self.rollout_engine.sleep()  # type: ignore
