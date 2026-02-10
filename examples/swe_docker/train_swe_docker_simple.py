@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SWE-bench Docker Training Test (Simplified)
-Uses Docker directly without swebench dependencies.
+Uses Docker directly with R2E-Gym XML function format.
 """
 
 import json
@@ -27,30 +27,126 @@ MAX_TOKENS = 4096
 TEMPERATURE = 1.0
 DEFAULT_REPO_PATH = "/testbed"
 
-SYSTEM_PROMPT = """You are an expert software engineering agent fixing bugs in a code repository.
+# R2E-Gym style system prompt
+SYSTEM_PROMPT = """You are a programming agent who is provided a github issue and repository bash environment and is tasked to solve certain tasks (e.g., file localization, testcase generation, code repair and editing etc) to resolve the issue.
 
-YOUR MISSION: Fix the bug and submit your solution within {max_steps} steps.
+We have access to the following functions:
 
-=== AVAILABLE ACTIONS ===
-- bash <command>: Execute shell command in /testbed
-- read <filepath>: Read file (first 1000 lines by default)
-- read <filepath> <start> <end>: Read specific line range
-- search <pattern> [path]: Search for pattern (grep -rn)
-- find_file <pattern>: Find files by name (supports *.py wildcards)
-- list_dir <path>: List directory contents
-- edit <filepath> <start_line> <end_line>
-<new_content>: Replace lines start_line to end_line with new_content
-- submit: Submit your solution for evaluation
+-- BEGIN FUNCTION #1: file_editor --
+Description:
+Custom editing tool for viewing, creating and editing files
+  - State is persistent across command calls and discussions with the user
+  - If path is a file, view displays the result of applying cat -n. If path is a directory, view lists non-hidden files and directories up to 2 levels deep
+  - The create command cannot be used if the specified path already exists as a file
+  - If a command generates a long output, it will be truncated and marked with <response clipped>
+  - The undo_edit command will revert the last edit made to the file at path
 
-=== OUTPUT FORMAT ===
-Thought: <your reasoning about what to do next>
-Action: <action_type> <arguments>
+Notes for using the str_replace command:
+  - The old_str parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
+  - If the old_str parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in old_str to make it unique
+  - The new_str parameter should contain the edited lines that should replace the old_str
 
-=== TIPS ===
-- The repository is at /testbed
-- Use search/find_file to locate the issue
-- Use edit to fix the bug
-- Always end with submit action"""
+Parameters:
+  1. command (string, required)
+Allowed values: [view, create, str_replace, insert, undo_edit]
+The command to run.
+  2. path (string, required)
+Absolute path to file or directory, e.g. /testbed/file.py or /testbed.
+  3. file_text (string, optional)
+Required for the create command. Contains the content of the file to be created.
+  4. old_str (string, optional)
+Required for the str_replace command. The exact string in path to replace.
+  5. new_str (string, optional)
+  - Optional for the str_replace command to specify the replacement string.
+  - Required for the insert command to specify the string to insert.
+  6. insert_line (integer, optional)
+Required for the insert command. The new_str will be inserted after the line number specified here.
+  7. view_range (array, optional)
+  - Optional for the view command (when path is a file).
+  - If provided, specifies the line range to view, e.g. [11, 12] shows lines 11 and 12.
+  - [start_line, -1] will show all lines from start_line to the end of file.
+  8. concise (boolean, optional)
+  - Optional for the view command.
+  - Defaults to True; displays a concise skeletal view of the file. If set to False, displays the full content in the specified view_range.
+
+-- END FUNCTION #1 --
+
+-- BEGIN FUNCTION #2: execute_bash --
+Description:
+Execute a bash command in the terminal.
+
+Behavior notes:
+  - If a command may run indefinitely (long-running), consider running it in the background and redirecting output, e.g. python3 app.py > server.log 2>&1 &.
+  - If the bash command returns exit code -1, it means the process is still running. The assistant may:
+  - Call this function again with command as an empty string ("") to retrieve additional logs.
+  - Send more input to STDIN of the running process by calling this function again with command set to the text input.
+  - Send command="ctrl+c" to interrupt the currently running process.
+  - If the command times out, it will be interrupted (SIGINT). The assistant may then retry or do further steps if needed.
+
+Parameters:
+  1. cmd (string, required)
+The bash command (and optional arguments) to execute.
+  - Can be empty ("") to retrieve more logs if the process is still running.
+  - Can be "ctrl+c" to interrupt the running process.
+
+-- END FUNCTION #2 --
+
+-- BEGIN FUNCTION #3: search --
+Description:
+Search for a term in a directory or a single file.
+  - If path is a directory (or unspecified, default is .), it recursively searches all non-hidden files and directories for the search term.
+  - If path points to a file, it runs a grep -n in that file to show line numbers matching the search term.
+  - If more than 100 files match in a directory search, results are truncated and the tool will inform you to narrow your search.
+  - If no matches are found, it will inform you as well.
+
+Parameters:
+  1. search_term (string, required)
+The term or string to search for in files.
+  2. path (string, optional)
+The file or directory to search in. Defaults to . if not specified.
+
+-- END FUNCTION #3 --
+
+-- BEGIN FUNCTION #4: finish --
+Description:
+Finish the interaction once the task is complete or if no further progress can be made.
+
+Behavior notes:
+  - The submit command finalizes your output.
+
+Parameters:
+  1. command (string, required)
+Currently allowed value: [submit]
+  2. result (string, optional)
+The result text or final message to submit. Defaults to an empty string if not provided.
+
+-- END FUNCTION #4 --
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<function=example_function_name>
+<parameter=example_parameter_1>value_1</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format, start with <function= and end with </function>
+- Required parameters MUST be specified
+- Only call one function at a time
+- VERY IMPORTANT: Each response must include both reasoning (as natural text) and function call (in above format) to solve the task.
+</IMPORTANT>
+
+REPOSITORY: {repo}
+BASE_COMMIT: {base_commit}
+
+ISSUE:
+{problem_statement}
+"""
 
 
 class SimpleDockerEnv:
@@ -100,10 +196,26 @@ class SimpleDockerEnv:
         output, _ = self.run("git add -A && git diff --cached")
         return output
 
-    def run_tests(self, timeout: int = 300) -> Tuple[str, int]:
-        """Run test script."""
-        output, code = self.run("/run_tests.sh", timeout=timeout)
-        return output, code
+    def run_tests(self, fail_to_pass: List[str], timeout: int = 300) -> Tuple[str, int, int, int]:
+        """Run specific tests and return (output, exit_code, passed, failed)."""
+        if not fail_to_pass:
+            output, code = self.run("/run_tests.sh", timeout=timeout)
+            return output, code, 0, 0
+
+        passed = 0
+        failed = 0
+        all_output = []
+
+        for test in fail_to_pass:
+            test_cmd = f"python -m pytest '{test}' -xvs 2>&1"
+            output, code = self.run(test_cmd, timeout=180)
+            all_output.append(f"=== Test: {test} ===\n{output}")
+            if code == 0:
+                passed += 1
+            else:
+                failed += 1
+
+        return "\n".join(all_output), 0 if failed == 0 else 1, passed, failed
 
     def stop(self):
         """Stop and remove container."""
@@ -122,133 +234,155 @@ def generate_response(messages: List[Dict]) -> str:
                 "temperature": TEMPERATURE,
             },
             timeout=300,
+            proxies={"http": None, "https": None},  # Disable proxy for localhost
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        content = response.json()["choices"][0]["message"]["content"]
+        # Remove <think>...</think> tags if present (for Qwen models)
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        return content.strip()
     except Exception as e:
         logger.error(f"Inference failed: {e}")
         raise
 
 
-def parse_action(response: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Parse model response to extract thought and action."""
-    lines = response.strip().split("\n")
+def parse_xml_action(response: str) -> Tuple[str, Dict]:
+    """Parse R2E-Gym XML-style action from model response."""
+    # Look for <function=name>...</function>
+    fn_match = re.search(r'<function=([\w_]+)>(.*?)</function>', response, re.DOTALL)
+    if not fn_match:
+        return "invalid", {"error": "No valid action found"}
 
-    thought = None
-    for line in lines:
-        if line.strip().lower().startswith("thought:"):
-            thought = line.split(":", 1)[1].strip()
-            break
+    fn_name = fn_match.group(1).strip()
+    fn_body = fn_match.group(2).strip()
 
-    # Find action
-    action_start_idx = None
-    for i, line in enumerate(lines):
-        if line.strip().lower().startswith("action:"):
-            action_start_idx = i
-            break
+    # Parse <parameter=key>value</parameter>
+    params = {}
+    for param_match in re.finditer(r'<parameter=([\w_]+)>(.*?)</parameter>', fn_body, re.DOTALL):
+        key = param_match.group(1).strip()
+        value = param_match.group(2).strip()
+        params[key] = value
 
-    if action_start_idx is None:
-        return thought, None, None
-
-    action_line = lines[action_start_idx].split(":", 1)[1].strip()
-    parts = action_line.split(None, 1)
-    if not parts:
-        return thought, None, None
-
-    action_type = parts[0].lower()
-    first_line_content = parts[1] if len(parts) > 1 else ""
-
-    # For edit actions, capture multiline content
-    if action_type == "edit":
-        remaining_lines = []
-        for line in lines[action_start_idx + 1:]:
-            if line.strip().lower().startswith(("thought:", "action:", "observation:")):
-                break
-            remaining_lines.append(line)
-        full_content = first_line_content + "\n" + "\n".join(remaining_lines) if remaining_lines else first_line_content
-        return thought, action_type, full_content.strip()
-
-    return thought, action_type, first_line_content
+    return fn_name, params
 
 
-def execute_action(env: SimpleDockerEnv, action_type: str, args: str) -> str:
-    """Execute action in Docker environment."""
+def execute_action(env: SimpleDockerEnv, action_type: str, params: Dict) -> str:
+    """Execute action in Docker environment using R2E-Gym format."""
     repo_path = DEFAULT_REPO_PATH
 
-    if action_type == "bash":
-        output, _ = env.run(args)
-        return output[:5000]
+    if action_type == "execute_bash":
+        cmd = params.get("cmd", params.get("command", ""))
+        if not cmd:
+            return "Error: No command provided"
+        output, _ = env.run(cmd)
+        return output[:8000]
 
-    elif action_type == "read":
-        parts = args.split()
-        filepath = parts[0]
-        if not filepath.startswith("/"):
-            filepath = f"{repo_path}/{filepath}"
+    elif action_type in ("file_editor", "str_replace_editor"):
+        command = params.get("command", "view")
+        path = params.get("path", "")
 
-        if len(parts) == 3:
-            start, end = int(parts[1]), int(parts[2])
-            output, _ = env.run(f"sed -n '{start},{end}p' {filepath}")
-        else:
-            output, _ = env.run(f"head -1000 {filepath}")
-        return output[:10000]
+        if not path:
+            return "Error: path is required"
 
-    elif action_type == "search":
-        parts = args.split(None, 1)
-        pattern = parts[0]
-        path = parts[1] if len(parts) > 1 else repo_path
-        output, _ = env.run(f"grep -rn '{pattern}' {path} 2>/dev/null | head -100")
-        return output[:5000]
-
-    elif action_type == "find_file":
-        output, _ = env.run(f"find {repo_path} -name '{args}' 2>/dev/null | head -50")
-        return output[:2000]
-
-    elif action_type == "list_dir":
-        path = args if args else repo_path
+        # Make path absolute if relative
         if not path.startswith("/"):
             path = f"{repo_path}/{path}"
-        output, _ = env.run(f"ls -la {path}")
-        return output[:2000]
 
-    elif action_type == "edit":
-        lines = args.split("\n")
-        if len(lines) < 2:
-            return "Error: edit requires filepath, line range, and new content"
-
-        first_line = lines[0].split()
-        if len(first_line) < 3:
-            return "Error: edit format: edit <filepath> <start> <end>\\n<new_content>"
-
-        filepath = first_line[0]
-        if not filepath.startswith("/"):
-            filepath = f"{repo_path}/{filepath}"
-        start = int(first_line[1])
-        end = int(first_line[2])
-        new_content = "\n".join(lines[1:])
-
-        # Write new content to temp file
-        content_b64 = base64.b64encode(new_content.encode()).decode()
-        env.run(f"echo '{content_b64}' | base64 -d > /tmp/edit_content.txt")
-
-        # Use sed to delete old lines and insert new content
-        if start == end:
-            env.run(f"sed -i '{start}d' {filepath}")
-            env.run(f"sed -i '{start-1}r /tmp/edit_content.txt' {filepath}")
-        else:
-            env.run(f"sed -i '{start},{end}d' {filepath}")
-            if start > 1:
-                env.run(f"sed -i '{start-1}r /tmp/edit_content.txt' {filepath}")
+        if command == "view":
+            view_range = params.get("view_range", "")
+            if view_range:
+                # Parse range like [11, 20] or "11, 20"
+                range_match = re.search(r'\[?(\d+),\s*(-?\d+)\]?', view_range)
+                if range_match:
+                    start = int(range_match.group(1))
+                    end = int(range_match.group(2))
+                    if end == -1:
+                        output, _ = env.run(f"sed -n '{start},$p' {path} | head -500 | cat -n")
+                    else:
+                        output, _ = env.run(f"sed -n '{start},{end}p' {path} | cat -n")
+                else:
+                    output, _ = env.run(f"cat -n {path} | head -500")
             else:
-                env.run(f"cat /tmp/edit_content.txt {filepath} > /tmp/temp_file && mv /tmp/temp_file {filepath}")
+                output, _ = env.run(f"cat -n {path} | head -500")
+            return output[:10000]
 
-        return f"Successfully edited {filepath}"
+        elif command == "str_replace":
+            old_str = params.get("old_str", "")
+            new_str = params.get("new_str", "")
 
-    elif action_type == "submit":
+            if not old_str:
+                return "Error: old_str is required for str_replace"
+
+            # Read file content
+            content_out, code = env.run(f"cat {path}")
+            if code != 0:
+                return f"Error reading file: {content_out}"
+
+            # Check if old_str exists
+            if old_str not in content_out:
+                return f"Error: old_str not found in {path}. Make sure it matches exactly including whitespace."
+
+            # Count occurrences
+            count = content_out.count(old_str)
+            if count > 1:
+                return f"Error: old_str appears {count} times in {path}. Please make it unique by including more context."
+
+            # Do replacement
+            new_content = content_out.replace(old_str, new_str, 1)
+
+            # Write back using base64 encoding
+            content_b64 = base64.b64encode(new_content.encode()).decode()
+            env.run(f"echo '{content_b64}' | base64 -d > {path}")
+            return f"Successfully replaced text in {path}"
+
+        elif command == "create":
+            file_text = params.get("file_text", "")
+            env.run(f"mkdir -p $(dirname {path})")
+            content_b64 = base64.b64encode(file_text.encode()).decode()
+            env.run(f"echo '{content_b64}' | base64 -d > {path}")
+            return f"Created {path}"
+
+        elif command == "insert":
+            new_str = params.get("new_str", "")
+            insert_line = params.get("insert_line", "0")
+            try:
+                line_num = int(insert_line)
+            except:
+                return f"Error: invalid insert_line: {insert_line}"
+
+            # Read file, insert, write back
+            content_out, _ = env.run(f"cat {path}")
+            lines = content_out.split("\n")
+            lines.insert(line_num, new_str)
+            new_content = "\n".join(lines)
+            content_b64 = base64.b64encode(new_content.encode()).decode()
+            env.run(f"echo '{content_b64}' | base64 -d > {path}")
+            return f"Inserted text after line {line_num} in {path}"
+
+        elif command == "undo_edit":
+            output, _ = env.run(f"git checkout -- {path}")
+            return f"Reverted changes to {path}"
+
+        return f"Unknown file_editor command: {command}"
+
+    elif action_type == "search":
+        search_term = params.get("search_term", "")
+        path = params.get("path", ".")
+
+        if not search_term:
+            return "Error: search_term is required"
+
+        if not path.startswith("/"):
+            path = f"{repo_path}/{path}"
+
+        output, _ = env.run(f"grep -rn '{search_term}' {path} 2>/dev/null | head -100")
+        return output[:5000] if output.strip() else f"No matches found for '{search_term}' in {path}"
+
+    elif action_type == "finish":
         return "SUBMIT"
 
-    elif action_type == "run_test":
-        output, _ = env.run(args, timeout=180)
-        return output[:5000]
+    elif action_type == "invalid":
+        return params.get("error", "Invalid action")
 
     else:
         return f"Unknown action: {action_type}"
@@ -257,6 +391,10 @@ def execute_action(env: SimpleDockerEnv, action_type: str, args: str) -> str:
 def run_rollout(instance: Dict, max_steps: int = 50) -> Dict:
     """Run a single rollout."""
     instance_id = instance.get("instance_id", "unknown")
+    repo = instance.get("repo", "")
+    base_commit = instance.get("base_commit", "")[:8]
+    problem_statement = instance.get("problem_statement", "Fix the bug in this repository.")
+
     logger.info(f"Starting rollout for {instance_id}")
 
     env = SimpleDockerEnv(instance)
@@ -265,14 +403,15 @@ def run_rollout(instance: Dict, max_steps: int = 50) -> Dict:
         env.start()
         logger.info(f"Docker container started for {instance_id}")
 
-        # Get problem statement
-        problem_stmt = instance.get("problem_statement", "Fix the bug in this repository.")
+        # Build system prompt with instance info
+        system_prompt = SYSTEM_PROMPT.format(
+            repo=repo,
+            base_commit=base_commit,
+            problem_statement=problem_statement[:8000]
+        )
 
-        # Initialize conversation
-        system_prompt = SYSTEM_PROMPT.format(max_steps=max_steps)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Problem Statement:\n{problem_stmt}\n\nThe repository is checked out at /testbed. Start by exploring the codebase to understand the issue."}
         ]
 
         trajectory = []
@@ -280,54 +419,66 @@ def run_rollout(instance: Dict, max_steps: int = 50) -> Dict:
         step = 0
 
         while not done and step < max_steps:
-            logger.info(f"Step {step + 1}/{max_steps}")
+            step += 1
+            logger.info(f"Step {step}/{max_steps}")
 
             # Generate response
             response = generate_response(messages)
             logger.info(f"Model response (first 500 chars): {response[:500]}")
 
-            # Parse action
-            thought, action_type, action_args = parse_action(response)
+            # Parse XML action
+            action_type, params = parse_xml_action(response)
+            logger.info(f"Action: {action_type}, params: {list(params.keys())}")
 
-            if action_type is None:
-                obs = "No valid action found. Please use format: Action: <type> <args>"
-                logger.warning(f"No valid action in response")
-            elif action_type == "submit":
+            # Execute action
+            if action_type == "finish" or (action_type == "invalid" and "finish" in response.lower()):
                 obs = "Submitting solution..."
                 done = True
             else:
-                obs = execute_action(env, action_type, action_args or "")
-                logger.info(f"Action: {action_type} -> Observation (first 200): {obs[:200]}...")
+                obs = execute_action(env, action_type, params)
+                logger.info(f"Observation (first 200): {obs[:200]}...")
 
             # Update messages
             messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": f"Observation:\n{obs}"})
+            messages.append({"role": "user", "content": f"Observation: {obs}"})
 
             trajectory.append({
                 "step": step,
-                "thought": thought,
                 "action_type": action_type,
-                "action_args": action_args,
+                "params": {k: v[:200] for k, v in params.items()},
                 "observation": obs[:1000],
             })
-            step += 1
 
-        # Run tests and get reward
+        # Run tests
         logger.info("Running tests...")
-        test_output, test_code = env.run_tests(timeout=300)
+        fail_to_pass = instance.get("FAIL_TO_PASS", [])
+        if isinstance(fail_to_pass, str):
+            try:
+                fail_to_pass = json.loads(fail_to_pass)
+            except:
+                fail_to_pass = [fail_to_pass] if fail_to_pass else []
 
-        # Simple reward: check if tests pass
-        # This is simplified - real evaluation uses swebench grading
-        reward = 1.0 if "PASSED" in test_output.upper() or test_code == 0 else 0.0
-        logger.info(f"Test result: code={test_code}, reward={reward}")
+        test_output, test_code, passed, failed = env.run_tests(fail_to_pass, timeout=300)
+
+        # Calculate reward
+        if fail_to_pass:
+            reward = passed / len(fail_to_pass) if len(fail_to_pass) > 0 else 0.0
+            resolved = passed == len(fail_to_pass)
+        else:
+            reward = 1.0 if "PASSED" in test_output.upper() or test_code == 0 else 0.0
+            resolved = reward > 0
+
+        logger.info(f"Test result: passed={passed}, failed={failed}, reward={reward}, resolved={resolved}")
 
         # Get patch
         patch = env.get_patch()
 
         return {
             "instance_id": instance_id,
+            "resolved": resolved,
             "final_reward": reward,
-            "test_code": test_code,
+            "test_passed": passed,
+            "test_failed": failed,
             "num_steps": step,
             "trajectory": trajectory,
             "patch": patch[:5000] if patch else "",
@@ -339,6 +490,7 @@ def run_rollout(instance: Dict, max_steps: int = 50) -> Dict:
         import traceback
         return {
             "instance_id": instance_id,
+            "resolved": False,
             "final_reward": 0.0,
             "error": str(e),
             "traceback": traceback.format_exc(),
@@ -353,7 +505,11 @@ def main():
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--output-dir", type=str, default="./outputs/docker_test")
+    parser.add_argument("--inference-url", type=str, default=INFERENCE_URL)
     args = parser.parse_args()
+
+    global INFERENCE_URL
+    INFERENCE_URL = args.inference_url
 
     # Load dataset
     instances = []
@@ -370,6 +526,7 @@ def main():
             INFERENCE_URL,
             json={"messages": [{"role": "user", "content": "test"}], "max_tokens": 5},
             timeout=30,
+            proxies={"http": None, "https": None},
         )
         logger.info(f"Inference server OK: {test_resp.status_code}")
     except Exception as e:
@@ -378,6 +535,8 @@ def main():
 
     # Run rollouts
     os.makedirs(args.output_dir, exist_ok=True)
+    results = []
+    resolved_count = 0
 
     for i, instance in enumerate(instances):
         logger.info(f"\n{'='*60}")
@@ -385,15 +544,23 @@ def main():
         logger.info(f"{'='*60}")
 
         result = run_rollout(instance, max_steps=args.max_steps)
+        results.append(result)
 
-        logger.info(f"Result: reward={result.get('final_reward')}, steps={result.get('num_steps')}")
+        if result.get("resolved"):
+            resolved_count += 1
 
-        # Save result
+        logger.info(f"Result: resolved={result.get('resolved')}, reward={result.get('final_reward')}, steps={result.get('num_steps')}")
+        logger.info(f"Progress: {resolved_count}/{i+1} resolved ({100*resolved_count/(i+1):.1f}%)")
+
+        # Save result incrementally
         output_file = os.path.join(args.output_dir, "docker_test_result.jsonl")
         with open(output_file, "a") as f:
             f.write(json.dumps(result) + "\n")
 
-    logger.info("\nTest complete!")
+    # Final summary
+    logger.info(f"\n{'='*60}")
+    logger.info(f"FINAL RESULTS: {resolved_count}/{len(results)} resolved ({100*resolved_count/len(results):.1f}%)")
+    logger.info(f"{'='*60}")
 
 
 if __name__ == "__main__":
