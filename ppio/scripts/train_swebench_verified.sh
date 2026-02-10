@@ -119,14 +119,14 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='deepswe-swebench' \
-    trainer.experiment_name='qwen3-32b-verified' \
+    trainer.experiment_name='qwen3-32b-verified-v6' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
     trainer.default_hdfs_dir=null \
-    trainer.default_local_dir=/3fsdata/data0/tengwan/checkpoints/deepswe-swebench/qwen3-32b-verified \
+    trainer.default_local_dir=/3fsdata/data0/tengwan/checkpoints/deepswe-swebench/qwen3-32b-verified-v6 \
     rllm.env.name=swe_ppio_multistep \
     rllm.agent.name=sweagent \
     rllm.agent.max_steps=30 \

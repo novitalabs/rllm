@@ -331,7 +331,10 @@ class SandboxPool:
     @property
     def active_count(self) -> int:
         with self._pool_lock:
-            return sum(1 for s in self._pool.values() if s is not None)
+            return sum(
+                1 for pool in self._repo_pools.values()
+                for s in pool.values() if s is not None
+            )
 
 
 # Global pool instance
@@ -401,20 +404,28 @@ class PPIOSandboxManager:
         return self.sandbox
 
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
-        """Run command and return (exit_code, output), catching exceptions"""
+        """Run command and return (exit_code, output), catching exceptions.
+
+        PPIO SDK throws CommandExitException on non-zero exit codes.
+        CommandExitException inherits from CommandResult and has stdout,
+        stderr, exit_code attributes. We catch it and extract the full
+        stdout to match R2E-Gym's Docker runtime behavior (always returns
+        both output and exit code).
+        """
         try:
             result = self.sandbox.commands.run(cmd, timeout=timeout)
-            return result.exit_code, result.stdout
+            return result.exit_code, result.stdout or ''
         except Exception as e:
-            # CommandExitException includes exit code and error in message
+            # CommandExitException has stdout, stderr, exit_code attributes
+            stdout = getattr(e, 'stdout', None)
+            exit_code = getattr(e, 'exit_code', None)
+            if stdout is not None and exit_code is not None:
+                return exit_code, stdout
+            # Fallback for other exceptions
             error_str = str(e)
-            # Try to extract stderr from exception if it has it
-            stderr = getattr(e, 'stderr', '') or getattr(e, 'error', '') or ''
+            stderr = getattr(e, 'stderr', '') or ''
             if stderr:
                 error_str = f"{error_str}\nstderr: {stderr}"
-            # Extract exit code if present
-            if "exit code" in error_str.lower():
-                return 1, error_str
             return 1, f"Command failed: {error_str}"
 
     def clone_repo(self, repo_url: str, commit: Optional[str] = None) -> tuple[bool, str]:
@@ -555,72 +566,208 @@ class PPIOSandboxManager:
 
 
 # =============================================================================
-# Test Output Parser
+# Test Output Parser (aligned with R2E-Gym parse_log_pytest)
 # =============================================================================
-def parse_pytest_output(output: str, fail_to_pass: list, pass_to_pass: list) -> TestResult:
-    """Parse pytest output and categorize test results"""
-    # Initialize result tracking
+def _decolor(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    return re.sub(r"\x1b\[[0-9;]*m|\r", "", text)
+
+
+def _parse_log_pytest(log: str) -> dict:
+    """Parse pytest log output into {test_name: status} dict.
+
+    Aligned with R2E-Gym's parse_log_pytest from execution_log_parser.py.
+    Parses the 'short test summary info' section of pytest output.
+    """
+    if not log:
+        return {}
+
+    test_status_map = {}
+
+    # Prefer parsing from "short test summary info" section (R2E-Gym approach)
+    if "short test summary info" in log:
+        summary = log.split("short test summary info")[1].strip()
+        for line in summary.split("\n"):
+            line = _decolor(line).strip()
+            if "PASSED" in line and "::" in line:
+                # Format: PASSED path/to/test.py::TestClass::test_method
+                # Extract after first "::" and join with "."
+                test_name = ".".join(line.split("::")[1:]).strip()
+                # Clean trailing whitespace/status from test name
+                test_name = test_name.split(" PASSED")[0].strip() if " PASSED" in test_name else test_name
+                if test_name:
+                    test_status_map[test_name] = "PASSED"
+            elif "FAILED" in line and "::" in line:
+                test_name = ".".join(line.split("::")[1:]).split(" - ")[0].strip()
+                test_name = test_name.split(" FAILED")[0].strip() if " FAILED" in test_name else test_name
+                if test_name:
+                    test_status_map[test_name] = "FAILED"
+            elif "ERROR" in line and "::" in line:
+                try:
+                    test_name = ".".join(line.split("::")[1:]).split(" - ")[0].strip()
+                    test_name = test_name.split(" ERROR")[0].strip() if " ERROR" in test_name else test_name
+                except IndexError:
+                    test_name = line
+                if test_name:
+                    test_status_map[test_name] = "ERROR"
+    else:
+        # Fallback: parse all lines with :: and PASSED/FAILED/ERROR
+        for line in log.split("\n"):
+            line = _decolor(line).strip()
+            if "::" in line and (" PASSED" in line or " FAILED" in line or " ERROR" in line):
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Keep full path::name format as well for matching
+                    full_name = parts[0]
+                    # Also extract dotted name
+                    dotted_name = ".".join(full_name.split("::")[1:]) if "::" in full_name else full_name
+                    status = "PASSED" if "PASSED" in parts[1] else ("FAILED" if "FAILED" in parts[1] else "ERROR")
+                    test_status_map[full_name] = status
+                    if dotted_name and dotted_name != full_name:
+                        test_status_map[dotted_name] = status
+
+    return test_status_map
+
+
+def _match_test_name(expected_name: str, parsed_results: dict) -> Optional[str]:
+    """Find matching test name in parsed results, trying multiple formats.
+
+    Args:
+        expected_name: Test name from FAIL_TO_PASS or PASS_TO_PASS list
+        parsed_results: Dict of {parsed_test_name: status}
+
+    Returns:
+        The status string ("PASSED", "FAILED", "ERROR") or None if not found
+    """
+    # Direct match
+    if expected_name in parsed_results:
+        return parsed_results[expected_name]
+
+    # Try dotted format: "path/test.py::Class::method" → "Class.method"
+    if "::" in expected_name:
+        dotted = ".".join(expected_name.split("::")[1:])
+        if dotted in parsed_results:
+            return parsed_results[dotted]
+
+    # Try substring matching (expected is substring of parsed or vice versa)
+    for result_name, status in parsed_results.items():
+        if expected_name in result_name or result_name in expected_name:
+            return status
+
+    # Try matching just the test function name
+    expected_func = expected_name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+    for result_name, status in parsed_results.items():
+        result_func = result_name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        if expected_func == result_func and expected_func:
+            return status
+
+    return None
+
+
+def parse_pytest_output(output: str, fail_to_pass: list, pass_to_pass: list, repo: str = "") -> TestResult:
+    """Parse test output and categorize test results.
+
+    Uses swebench.harness.log_parsers.MAP_REPO_TO_PARSER for repo-specific
+    parsing (Django uses unittest format, sympy has its own format, etc.)
+    and swebench.harness.grading for standardized evaluation matching
+    SWE-bench's official grading logic.
+
+    Args:
+        output: Raw test output from running the test command
+        fail_to_pass: List of test names expected to change from fail to pass
+        pass_to_pass: List of test names expected to remain passing
+        repo: Repository name (e.g., "django/django") for parser selection
+    """
+    try:
+        from swebench.harness.log_parsers import MAP_REPO_TO_PARSER as SWEBENCH_PARSERS
+        from swebench.harness.grading import get_eval_tests_report, get_resolution_status
+        from swebench.harness.constants import (
+            ResolvedStatus, TestStatus,
+            FAIL_TO_PASS as F2P_KEY, PASS_TO_PASS as P2P_KEY,
+        )
+
+        # Get repo-specific parser (parsers don't actually use test_spec parameter)
+        parser = SWEBENCH_PARSERS.get(repo)
+        if parser is not None:
+            eval_status_map = parser(output, None)
+        else:
+            # Repo not in swebench parsers, use default pytest parser
+            eval_status_map = SWEBENCH_PARSERS["pytest-dev/pytest"](output, None)
+
+        # Use swebench grading for standard evaluation
+        gold_results = {
+            F2P_KEY: fail_to_pass,
+            P2P_KEY: pass_to_pass,
+        }
+        report = get_eval_tests_report(eval_status_map, gold_results)
+        resolved = get_resolution_status(report) == ResolvedStatus.FULL.value
+
+        f2p_success = report[F2P_KEY]["success"]
+        f2p_failure = report[F2P_KEY]["failure"]
+        p2p_success = report[P2P_KEY]["success"]
+        p2p_failure = report[P2P_KEY]["failure"]
+
+        passed = sum(1 for v in eval_status_map.values() if v in (TestStatus.PASSED.value, TestStatus.XFAIL.value))
+        failed = sum(1 for v in eval_status_map.values() if v in (TestStatus.FAILED.value, TestStatus.ERROR.value))
+        errors = sum(1 for v in eval_status_map.values() if v == TestStatus.ERROR.value)
+
+        return TestResult(
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            total=len(eval_status_map),
+            f2p_success=f2p_success,
+            f2p_failure=f2p_failure,
+            p2p_success=p2p_success,
+            p2p_failure=p2p_failure,
+            resolved=resolved,
+            test_output=output,
+        )
+    except Exception as e:
+        print(f"[parse_pytest_output] swebench parser error: {e}, falling back to basic parser")
+        return _parse_pytest_output_basic(output, fail_to_pass, pass_to_pass)
+
+
+def _parse_pytest_output_basic(output: str, fail_to_pass: list, pass_to_pass: list) -> TestResult:
+    """Fallback parser when swebench parsers are not available."""
+    parsed_results = _parse_log_pytest(output)
+
     f2p_success = []
     f2p_failure = []
     p2p_success = []
     p2p_failure = []
 
-    # Parse individual test results
-    test_results = {}
-    for line in output.split('\n'):
-        line = line.strip()
-        # Match patterns like "test_file.py::test_name PASSED" or "FAILED"
-        if '::' in line and (' PASSED' in line or ' FAILED' in line or ' ERROR' in line):
-            parts = line.split()
-            if len(parts) >= 2:
-                test_name = parts[0]
-                status = parts[1] if len(parts) > 1 else "UNKNOWN"
-                # Normalize test name (remove module prefix variations)
-                test_results[test_name] = status == "PASSED"
-
-    # Categorize tests
     for test in fail_to_pass:
-        # Check if test passed (try different name formats)
-        passed = False
-        for result_name, result_passed in test_results.items():
-            if test in result_name or result_name in test:
-                passed = result_passed
-                break
-        if passed:
+        status = _match_test_name(test, parsed_results)
+        if status == "PASSED":
             f2p_success.append(test)
         else:
             f2p_failure.append(test)
 
     for test in pass_to_pass:
-        # Check if test still passes
-        passed = True  # Default to pass if not found
-        for result_name, result_passed in test_results.items():
-            if test in result_name or result_name in test:
-                passed = result_passed
-                break
-        if passed:
+        status = _match_test_name(test, parsed_results)
+        if status is None:
+            p2p_success.append(test)
+        elif status == "PASSED":
             p2p_success.append(test)
         else:
             p2p_failure.append(test)
 
-    # Calculate totals from parsed output
-    passed = sum(1 for v in test_results.values() if v)
-    failed = sum(1 for v in test_results.values() if not v)
-
-    # Check if resolved: all FAIL_TO_PASS must pass, no PASS_TO_PASS can fail
+    passed = sum(1 for v in parsed_results.values() if v == "PASSED")
+    failed = sum(1 for v in parsed_results.values() if v in ("FAILED", "ERROR"))
     resolved = (len(f2p_failure) == 0 and len(p2p_failure) == 0 and len(f2p_success) > 0)
 
     return TestResult(
         passed=passed,
         failed=failed,
-        errors=0,
-        total=passed + failed,
+        errors=sum(1 for v in parsed_results.values() if v == "ERROR"),
+        total=len(parsed_results),
         f2p_success=f2p_success,
         f2p_failure=f2p_failure,
         p2p_success=p2p_success,
         p2p_failure=p2p_failure,
         resolved=resolved,
-        test_output=output
+        test_output=output,
     )
 
 
@@ -741,19 +888,40 @@ def swebench_ppio_reward_fn(task_info: dict, action: str) -> RewardOutput:
                 "error": "Failed to install dependencies"
             })
 
-        # Build test command from FAIL_TO_PASS tests
-        if fail_to_pass:
-            tests_to_run = " ".join(fail_to_pass)
-            full_test_cmd = f"{test_cmd} {tests_to_run}"
+        # Build and run eval script using swebench TestSpec (matches Standard flow)
+        from .swe_ppio_multistep import build_eval_script
+        eval_script, test_cmd_full = build_eval_script(task_info)
+        eval_script = eval_script.replace("__WORKDIR__", manager.workdir)
+
+        # Write eval script to sandbox
+        import base64
+        eval_path = f"{manager.workdir}/_eval.sh"
+        script_b64 = base64.b64encode(eval_script.encode()).decode()
+        manager._run_command(
+            f"echo '{script_b64}' | base64 -d > {eval_path} && chmod +x {eval_path}",
+            timeout=30
+        )
+
+        # Run eval script
+        print(f"[{instance_id}] Running eval script (test_cmd: {test_cmd_full})")
+        exit_code, output = manager._run_command(
+            f"cd {manager.workdir} && bash {eval_path} 2>&1",
+            timeout=1800
+        )
+        manager._run_command(f"rm -f {eval_path}", timeout=10)
+
+        # Extract test output between markers
+        start_marker = ">>>>> Start Test Output"
+        end_marker = ">>>>> End Test Output"
+        if start_marker in output:
+            test_output = output.split(start_marker, 1)[1]
+            if end_marker in test_output:
+                test_output = test_output.split(end_marker, 1)[0]
         else:
-            full_test_cmd = test_cmd
+            test_output = output
 
-        # Run tests
-        print(f"[{instance_id}] Running tests: {full_test_cmd}")
-        exit_code, test_output = manager.run_tests(full_test_cmd, timeout=1800)
-
-        # Parse results
-        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass)
+        # Parse results using repo-specific swebench parser
+        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass, repo=repo)
 
         # Calculate reward
         # Full resolution = 1.0, partial = proportion of tests passed

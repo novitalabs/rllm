@@ -25,51 +25,11 @@ from .ppio_reward import (
     REPO_TEMPLATE_MAP,
     normalize_repo_name,
 )
+from .swe_ppio_multistep import build_eval_script
 
 
 # Setup proxy
 setup_proxy_tunnel()
-
-
-# Hardcoded test commands for common repos (from SWE-bench harness)
-REPO_TEST_CMDS = {
-    "django/django": "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
-    "sympy/sympy": "bin/test -C --verbose",
-    "pytest-dev/pytest": "pytest -rA",
-    "matplotlib/matplotlib": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "scikit-learn/scikit-learn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "astropy/astropy": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "sphinx-doc/sphinx": "tox -e py39 --",
-    "pylint-dev/pylint": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "pallets/flask": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "psf/requests": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "pydata/xarray": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "mwaskom/seaborn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-}
-
-
-def get_test_cmd_for_repo(repo: str) -> str:
-    """Get repo-specific test command."""
-    return REPO_TEST_CMDS.get(repo, "pytest -xvs")
-
-
-def convert_test_names_for_django(fail_to_pass):
-    """Convert unittest test names to Django module format.
-
-    Django tests use format: test_method(module.TestClass)
-    Need to extract module path for runtests.py
-    """
-    modules = set()
-    for test in fail_to_pass:
-        match = re.match(r"[^(]+\(([^)]+)\)", test)
-        if match:
-            full_path = match.group(1)
-            parts = full_path.rsplit(".", 1)
-            if len(parts) >= 1:
-                modules.add(parts[0])
-        else:
-            modules.add(test)
-    return " ".join(sorted(modules))
 
 
 def parse_fail_to_pass(fail_to_pass):
@@ -131,6 +91,7 @@ class SWEBenchPPIOEnv(BaseEnv):
         self.api_key = self._load_api_key()
         self.task_instruction = ""
         self.total_steps = 0
+        self._last_reward: Optional[float] = None
 
         # Get repo from entry for template selection
         self.repo = entry.get("repo", "") if entry else ""
@@ -262,33 +223,43 @@ Your response should include a patch in unified diff format starting with "diff 
                 "output": output[:500]
             }
 
-        # Run tests
+        # Parse FAIL_TO_PASS / PASS_TO_PASS for grading (NOT for test command)
         fail_to_pass = self.entry.get("FAIL_TO_PASS", []) if self.entry else []
         pass_to_pass = self.entry.get("PASS_TO_PASS", []) if self.entry else []
-
-        # Parse JSON strings if needed (some datasets store as string)
         fail_to_pass = parse_fail_to_pass(fail_to_pass)
         pass_to_pass = parse_fail_to_pass(pass_to_pass)
-
-        # Get repo-specific test command
         repo = self.entry.get("repo", "") if self.entry else ""
-        test_cmd = get_test_cmd_for_repo(repo)
-        is_django = "runtests.py" in test_cmd
 
-        # Build test command
-        if fail_to_pass:
-            if is_django:
-                tests_to_run = convert_test_names_for_django(fail_to_pass)
-            else:
-                tests_to_run = " ".join(fail_to_pass)
-            full_test_cmd = f"{test_cmd} {tests_to_run}"
+        # Run eval script (uses test_patch directives, matching Standard flow)
+        eval_script, test_cmd = build_eval_script(self.entry)
+        eval_script = eval_script.replace("__WORKDIR__", self.sandbox_manager.workdir)
+
+        # Write and run eval script
+        import base64
+        eval_path = f"{self.sandbox_manager.workdir}/_eval.sh"
+        script_b64 = base64.b64encode(eval_script.encode()).decode()
+        self.sandbox_manager._run_command(
+            f"echo '{script_b64}' | base64 -d > {eval_path} && chmod +x {eval_path}",
+            timeout=30
+        )
+        exit_code, output = self.sandbox_manager._run_command(
+            f"cd {self.sandbox_manager.workdir} && bash {eval_path} 2>&1",
+            timeout=1800
+        )
+        self.sandbox_manager._run_command(f"rm -f {eval_path}", timeout=10)
+
+        # Extract test output between markers
+        start_marker = ">>>>> Start Test Output"
+        end_marker = ">>>>> End Test Output"
+        if start_marker in output:
+            test_output = output.split(start_marker, 1)[1]
+            if end_marker in test_output:
+                test_output = test_output.split(end_marker, 1)[0]
         else:
-            full_test_cmd = test_cmd
+            test_output = output
 
-        exit_code, test_output = self.sandbox_manager.run_tests(full_test_cmd, timeout=1800)
-
-        # Parse results
-        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass)
+        # Parse results using repo-specific swebench parser
+        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass, repo=repo)
 
         # Calculate reward
         if result.resolved:
@@ -300,6 +271,9 @@ Your response should include a patch in unified diff format starting with "diff 
 
         # Environment is done after one patch attempt
         done = True
+
+        # Store reward for compute_final_reward()
+        self._last_reward = reward
 
         observation = f"""Test Results:
 - Tests Passed: {result.passed}
@@ -322,8 +296,13 @@ Your response should include a patch in unified diff format starting with "diff 
         return observation, reward, done, info
 
     def compute_final_reward(self) -> float:
-        """Compute the final reward for the episode."""
-        # For SWE-bench, the step already computes the final reward
+        """Compute the final reward for the episode.
+
+        Returns the reward computed during step(), which the execution engine
+        uses to assign the trajectory reward.
+        """
+        if self._last_reward is not None:
+            return self._last_reward
         return 0.0
 
     def close(self):

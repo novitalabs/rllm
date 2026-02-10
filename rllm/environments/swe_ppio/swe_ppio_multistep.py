@@ -138,42 +138,129 @@ class FileState:
 
 
 # =============================================================================
-# Test Commands
+# Test Command & Eval Script Generation (using swebench TestSpec)
 # =============================================================================
-REPO_TEST_CMDS = {
+
+# Fallback test commands (only used if swebench specs unavailable)
+REPO_TEST_CMDS_FALLBACK = {
     "django/django": "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
-    "sympy/sympy": "bin/test -C --verbose",
+    "sympy/sympy": "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose",
     "pytest-dev/pytest": "pytest -rA",
-    "matplotlib/matplotlib": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "scikit-learn/scikit-learn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "astropy/astropy": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "sphinx-doc/sphinx": "tox -e py39 --",
-    "pylint-dev/pylint": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "pallets/flask": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "psf/requests": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "pydata/xarray": "pytest --no-header -rA --tb=no -p no:cacheprovider",
-    "mwaskom/seaborn": "pytest --no-header -rA --tb=no -p no:cacheprovider",
+    "matplotlib/matplotlib": "pytest -rA",
+    "scikit-learn/scikit-learn": "pytest -rA",
+    "astropy/astropy": "pytest -rA",
+    "sphinx-doc/sphinx": "tox --current-env -epy39 -v --",
+    "pylint-dev/pylint": "pytest -rA",
+    "pallets/flask": "pytest -rA",
+    "psf/requests": "pytest -rA",
+    "pydata/xarray": "pytest -rA",
+    "mwaskom/seaborn": "pytest --no-header -rA",
 }
 
 
-def get_test_cmd_for_repo(repo: str) -> str:
-    """Get repo-specific test command."""
-    return REPO_TEST_CMDS.get(repo, "pytest -xvs")
+def build_eval_script(entry: dict) -> tuple[str, str]:
+    """Build evaluation script using swebench's TestSpec, matching Standard flow.
 
+    The Standard (Docker/R2E-Gym) implementation:
+    1. Extracts test directives from test_patch (NOT from FAIL_TO_PASS/PASS_TO_PASS)
+    2. Resets test files to base_commit
+    3. Applies test_patch (adds/modifies test files)
+    4. Runs test command with proper directives
+    5. Resets test files after
 
-def convert_test_names_for_django(fail_to_pass):
-    """Convert unittest test names to Django module format."""
-    modules = set()
-    for test in fail_to_pass:
-        match = re.match(r"[^(]+\(([^)]+)\)", test)
-        if match:
-            full_path = match.group(1)
-            parts = full_path.rsplit(".", 1)
-            if len(parts) >= 1:
-                modules.add(parts[0])
-        else:
-            modules.add(test)
-    return " ".join(sorted(modules))
+    Returns:
+        (eval_script, test_cmd) - the full bash eval script and the test command alone
+    """
+    repo = entry.get("repo", "")
+    version = entry.get("version", "")
+    base_commit = entry.get("base_commit", "")
+    test_patch = entry.get("test_patch", "")
+    instance_id = entry.get("instance_id", "")
+
+    try:
+        from swebench.harness.test_spec.python import get_test_directives, get_modified_files
+        from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
+
+        # Build instance dict for swebench functions
+        instance = {
+            "repo": repo,
+            "instance_id": instance_id,
+            "test_patch": test_patch,
+            "version": version,
+            "base_commit": base_commit,
+        }
+
+        # Get test directives from test_patch (file paths, not test names)
+        directives = get_test_directives(instance)
+
+        # Get version-specific test command from swebench specs
+        specs = MAP_REPO_VERSION_TO_SPECS.get(repo, {}).get(version, {})
+        test_cmd_base = specs.get("test_cmd", REPO_TEST_CMDS_FALLBACK.get(repo, "pytest -rA"))
+
+        # Build full test command: base_cmd + directives
+        test_cmd = " ".join([test_cmd_base] + directives)
+
+        # Get eval_commands (env vars needed for some repos like Django)
+        eval_commands = specs.get("eval_commands", [])
+
+        # Get install command from specs
+        install_cmd = specs.get("install", "")
+
+        # Get modified test files for reset
+        test_files = []
+        if test_patch:
+            try:
+                test_files = get_modified_files(test_patch)
+            except Exception:
+                # Fallback: extract from diff headers
+                test_files = re.findall(r"diff --git a/.* b/(.*)", test_patch)
+
+        # Build eval script matching Standard flow
+        HEREDOC_DELIMITER = "EOF_114329324912"
+        script_lines = ["#!/bin/bash", "set -uxo pipefail"]
+
+        # Add eval commands (env vars)
+        for cmd in eval_commands:
+            script_lines.append(cmd)
+
+        # cd to workdir (will be replaced with actual workdir)
+        script_lines.append("cd __WORKDIR__")
+
+        # Reset test files to base_commit (undo any changes model made to tests)
+        if test_files and base_commit:
+            reset_cmd = f"git checkout {base_commit} {' '.join(test_files)}"
+            script_lines.append(reset_cmd)
+
+        # Apply test_patch (adds the tests that verify the fix)
+        if test_patch:
+            script_lines.append(
+                f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{test_patch}\n{HEREDOC_DELIMITER}"
+            )
+
+        # Note: install is skipped here because reset() already ran install_deps().
+        # The Standard includes reinstall in eval script, but it adds significant
+        # latency for compiled packages (sklearn, matplotlib). For editable installs
+        # (pip install -e .), source changes are reflected immediately.
+
+        # Run the actual test command
+        script_lines.append(f": '>>>>> Start Test Output'")
+        script_lines.append(test_cmd)
+        script_lines.append(f": '>>>>> End Test Output'")
+
+        # Reset test files after running
+        if test_files and base_commit:
+            reset_cmd = f"git checkout {base_commit} {' '.join(test_files)}"
+            script_lines.append(reset_cmd)
+
+        eval_script = "\n".join(script_lines)
+        print(f"[build_eval_script] {instance_id}: test_cmd='{test_cmd}', directives={directives}, test_files={test_files}")
+        return eval_script, test_cmd
+
+    except Exception as e:
+        print(f"[build_eval_script] Failed to use swebench TestSpec for {instance_id}: {e}")
+        # Fallback: use old approach but still better than FAIL_TO_PASS names
+        test_cmd = REPO_TEST_CMDS_FALLBACK.get(repo, "pytest -rA")
+        return f"#!/bin/bash\ncd __WORKDIR__\n{test_cmd}", test_cmd
 
 
 def parse_fail_to_pass(fail_to_pass):
@@ -260,8 +347,8 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
         # File state tracking for undo support
         self.file_states: dict[str, FileState] = {}
 
-        # Accumulated reward (for partial credit)
-        self.accumulated_reward = 0.0
+        # Reward from submit (None = not submitted yet)
+        self._submit_reward: Optional[float] = None
 
     @property
     def idx(self) -> Any:
@@ -342,7 +429,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         self.total_steps = 0
         self.file_states = {}
-        self.accumulated_reward = 0.0
+        self._submit_reward = None
 
         return {"task_instruction": self.task_instruction}, {
             "instance_id": self.entry.get("instance_id", "unknown") if self.entry else "unknown",
@@ -653,6 +740,55 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
 
         return output, 0.0, False, {}
 
+    def _run_eval_script(self, entry: dict) -> tuple[int, str]:
+        """Run the eval script in sandbox, matching Standard (Docker/R2E-Gym) flow.
+
+        Generates eval script using swebench TestSpec:
+        1. Sets up env vars (e.g. LANG for Django)
+        2. Resets test files to base_commit
+        3. Applies test_patch (adds tests that verify the fix)
+        4. Runs test command with proper directives from test_patch
+        5. Resets test files after
+
+        Returns:
+            (exit_code, test_output) - only the test output between markers
+        """
+        eval_script, test_cmd = build_eval_script(entry)
+
+        # Replace workdir placeholder
+        eval_script = eval_script.replace("__WORKDIR__", self.workdir)
+
+        # Write eval script to sandbox
+        eval_script_path = f"{self.workdir}/_eval.sh"
+        import base64
+        script_b64 = base64.b64encode(eval_script.encode()).decode()
+        self.sandbox_manager._run_command(
+            f"echo '{script_b64}' | base64 -d > {eval_script_path} && chmod +x {eval_script_path}",
+            timeout=30
+        )
+
+        # Run eval script
+        exit_code, output = self.sandbox_manager._run_command(
+            f"cd {self.workdir} && bash {eval_script_path} 2>&1",
+            timeout=self.reward_timeout
+        )
+
+        # Extract test output between markers (matching Standard flow)
+        start_marker = ">>>>> Start Test Output"
+        end_marker = ">>>>> End Test Output"
+        if start_marker in output:
+            test_output = output.split(start_marker, 1)[1]
+            if end_marker in test_output:
+                test_output = test_output.split(end_marker, 1)[0]
+        else:
+            # No markers found - use full output (fallback)
+            test_output = output
+
+        # Clean up
+        self.sandbox_manager._run_command(f"rm -f {eval_script_path}", timeout=10)
+
+        return exit_code, test_output
+
     def _submit(self, action: ParsedAction) -> tuple[str, float, bool, dict]:
         """Submit solution and compute reward."""
         # Get git diff as patch
@@ -669,38 +805,31 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
             )
 
         if not patch.strip():
+            self._submit_reward = 0.0
             return "No changes detected. Did you make any modifications?", 0.0, True, {
                 "resolved": False,
                 "error": "No patch"
             }
 
-        # Run tests
+        # Parse FAIL_TO_PASS / PASS_TO_PASS for grading (NOT for test command)
         fail_to_pass = self.entry.get("FAIL_TO_PASS", []) if self.entry else []
         pass_to_pass = self.entry.get("PASS_TO_PASS", []) if self.entry else []
-
-        # Parse JSON strings if needed
         fail_to_pass = parse_fail_to_pass(fail_to_pass)
         pass_to_pass = parse_fail_to_pass(pass_to_pass)
-
-        # Get repo-specific test command
         repo = self.entry.get("repo", "") if self.entry else ""
-        test_cmd = get_test_cmd_for_repo(repo)
-        is_django = "runtests.py" in test_cmd
 
-        # Build test command
-        if fail_to_pass:
-            if is_django:
-                tests_to_run = convert_test_names_for_django(fail_to_pass)
-            else:
-                tests_to_run = " ".join(fail_to_pass)
-            full_test_cmd = f"{test_cmd} {tests_to_run}"
-        else:
-            full_test_cmd = test_cmd
+        # Run eval script (uses test_patch directives for test command, NOT FAIL_TO_PASS names)
+        print(f"[_submit] Running eval script for {self.entry.get('instance_id', 'unknown')}...")
+        exit_code, test_output = self._run_eval_script(self.entry)
+        print(f"[_submit] Test exit_code={exit_code}, output_len={len(test_output) if test_output else 0}")
+        print(f"[_submit] Test output (last 500 chars): {test_output[-500:] if test_output else 'EMPTY'}")
 
-        exit_code, test_output = self.sandbox_manager.run_tests(full_test_cmd, timeout=self.reward_timeout)
-
-        # Parse results
-        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass)
+        # Parse results using repo-specific swebench parser
+        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass, repo=repo)
+        print(f"[_submit] Parse result: passed={result.passed}, failed={result.failed}, total={result.total}")
+        print(f"[_submit] f2p_success={result.f2p_success}, f2p_failure={result.f2p_failure}")
+        print(f"[_submit] p2p_success_count={len(result.p2p_success)}, p2p_failure={result.p2p_failure}")
+        print(f"[_submit] resolved={result.resolved}")
 
         # Calculate reward
         if result.resolved:
@@ -709,6 +838,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
             reward = len(result.f2p_success) / len(fail_to_pass)
         else:
             reward = 0.0
+        print(f"[_submit] reward={reward}")
 
         observation = f"""Test Results:
 - Tests Passed: {result.passed}
@@ -730,11 +860,66 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
             "patch": patch[:1000],
         }
 
+        # Store reward for compute_final_reward()
+        self._submit_reward = reward
+
         return observation, reward, True, info
 
+    def _run_evaluation(self) -> float:
+        """Run test evaluation (used when episode ends without explicit submit)."""
+        if not self.sandbox_manager or not self.entry:
+            return 0.0
+
+        try:
+            # Get git diff as patch
+            exit_code, patch = self.sandbox_manager._run_command(
+                f"cd {self.workdir} && git diff HEAD",
+                timeout=30
+            )
+            if exit_code != 0 or not patch.strip():
+                exit_code, patch = self.sandbox_manager._run_command(
+                    f"cd {self.workdir} && git diff",
+                    timeout=30
+                )
+            if not patch.strip():
+                return 0.0
+
+            # Parse FAIL_TO_PASS / PASS_TO_PASS for grading
+            fail_to_pass = self.entry.get("FAIL_TO_PASS", [])
+            pass_to_pass = self.entry.get("PASS_TO_PASS", [])
+            fail_to_pass = parse_fail_to_pass(fail_to_pass)
+            pass_to_pass = parse_fail_to_pass(pass_to_pass)
+            repo = self.entry.get("repo", "")
+
+            # Run eval script (uses test_patch directives, matching Standard flow)
+            exit_code, test_output = self._run_eval_script(self.entry)
+
+            result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass, repo=repo)
+
+            if result.resolved:
+                return 1.0
+            elif len(fail_to_pass) > 0:
+                return len(result.f2p_success) / len(fail_to_pass)
+            else:
+                return 0.0
+        except Exception as e:
+            print(f"[compute_final_reward] Evaluation failed: {e}")
+            return 0.0
+
     def compute_final_reward(self) -> float:
-        """Compute final reward (called when episode ends)."""
-        return self.accumulated_reward
+        """Compute final reward (called by execution engine after episode ends).
+
+        If submit was already called, returns the stored reward.
+        Otherwise, runs evaluation to compute reward from current state.
+        """
+        if self._submit_reward is not None:
+            print(f"[compute_final_reward] Returning stored submit reward: {self._submit_reward}")
+            return self._submit_reward
+        # Episode ended without submit (timeout/max_steps) - run evaluation
+        print(f"[compute_final_reward] No submit reward, running evaluation...")
+        reward = self._run_evaluation()
+        print(f"[compute_final_reward] Evaluation reward: {reward}")
+        return reward
 
     def close(self):
         """Clean up resources."""
