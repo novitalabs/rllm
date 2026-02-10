@@ -426,7 +426,7 @@ class DatasetRegistry:
                     "style": "rule",
                     "ground_truth": None,
                 },
-                "extra_info": entry,
+                "extra_info": json.dumps(entry, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x)),
             }
             processed_data.append(processed_entry)
         return processed_data
