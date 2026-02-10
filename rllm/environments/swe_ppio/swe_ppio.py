@@ -58,6 +58,7 @@ class SWEBenchPPIOEnv(BaseEnv):
         workdir: str = DEFAULT_WORKDIR,
         use_pool: bool = True,
         pool_size: int = 32,
+        sandbox_pause: bool = True,
     ):
         """Initialize the environment.
 
@@ -69,6 +70,7 @@ class SWEBenchPPIOEnv(BaseEnv):
             workdir: Working directory in sandbox (default: /testbed for pre-built templates)
             use_pool: Whether to use sandbox pool (recommended to avoid 429)
             pool_size: Size of sandbox pool for reuse
+            sandbox_pause: Whether to pause/resume sandboxes between uses (saves cost but adds latency)
         """
         import threading
         if SWEBenchPPIOEnv._counter_lock is None:
@@ -81,6 +83,7 @@ class SWEBenchPPIOEnv(BaseEnv):
         self.workdir = workdir
         self.use_pool = use_pool
         self.pool_size = pool_size
+        self.sandbox_pause = sandbox_pause
 
         # Assign trajectory index from counter
         with SWEBenchPPIOEnv._counter_lock:
@@ -124,9 +127,9 @@ class SWEBenchPPIOEnv(BaseEnv):
         Returns:
             Tuple of (observation_dict, info_dict)
         """
-        # Release sandbox back to pool (pause, don't destroy)
+        # Release sandbox back to pool
         if self.sandbox_manager:
-            self.sandbox_manager.cleanup(pause=True)
+            self.sandbox_manager.cleanup(pause=self.sandbox_pause)
             self.sandbox_manager = None
 
         # Update repo from entry if available
@@ -143,6 +146,7 @@ class SWEBenchPPIOEnv(BaseEnv):
             trajectory_idx=self.trajectory_idx,
             pool_size=self.pool_size,
             repo=self.repo,
+            sandbox_pause=self.sandbox_pause,
         )
         self.sandbox_manager.create_sandbox()
 
@@ -306,9 +310,9 @@ Your response should include a patch in unified diff format starting with "diff 
         return 0.0
 
     def close(self):
-        """Clean up resources (pause sandbox, keep in pool)."""
+        """Clean up resources."""
         if self.sandbox_manager:
-            self.sandbox_manager.cleanup(pause=True)
+            self.sandbox_manager.cleanup(pause=self.sandbox_pause)
             self.sandbox_manager = None
 
     @classmethod

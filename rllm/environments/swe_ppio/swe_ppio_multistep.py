@@ -302,6 +302,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
         step_timeout: int = 90,
         max_steps: int = 50,
         reward_timeout: int = 1800,
+        sandbox_pause: bool = True,
     ):
         """Initialize the multi-step environment.
 
@@ -316,6 +317,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
             step_timeout: Timeout for each tool execution (seconds)
             max_steps: Maximum steps before forced termination
             reward_timeout: Timeout for test execution (seconds)
+            sandbox_pause: Whether to pause/resume sandboxes between uses (saves cost but adds latency)
         """
         if SWEBenchPPIOMultiStepEnv._counter_lock is None:
             SWEBenchPPIOMultiStepEnv._counter_lock = threading.Lock()
@@ -330,6 +332,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
         self.step_timeout = step_timeout
         self.max_steps = max_steps
         self.reward_timeout = reward_timeout
+        self.sandbox_pause = sandbox_pause
 
         # Assign trajectory index from counter
         with SWEBenchPPIOMultiStepEnv._counter_lock:
@@ -376,7 +379,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
         """Reset the environment to initial state."""
         # Release sandbox back to pool
         if self.sandbox_manager:
-            self.sandbox_manager.cleanup(pause=True)
+            self.sandbox_manager.cleanup(pause=self.sandbox_pause)
             self.sandbox_manager = None
 
         # Update repo from entry
@@ -392,6 +395,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
             trajectory_idx=self.trajectory_idx,
             pool_size=self.pool_size,
             repo=self.repo,
+            sandbox_pause=self.sandbox_pause,
         )
         self.sandbox_manager.create_sandbox()
 
@@ -924,7 +928,7 @@ class SWEBenchPPIOMultiStepEnv(BaseEnv):
     def close(self):
         """Clean up resources."""
         if self.sandbox_manager:
-            self.sandbox_manager.cleanup(pause=True)
+            self.sandbox_manager.cleanup(pause=self.sandbox_pause)
             self.sandbox_manager = None
 
     @classmethod

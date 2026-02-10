@@ -1,0 +1,65 @@
+FROM vllm/vllm-openai:v0.10.2
+
+# =============================================================================
+# DeepSWE Training Image for Multi-Node 32xH200
+# Base: vllm/vllm-openai:v0.10.2 (includes torch, cuda, vllm 0.10.2)
+#
+# Build (from rllm repo root, on each node):
+#   docker build --network=host \
+#     --build-arg http_proxy=http://127.0.0.1:1083 \
+#     --build-arg https_proxy=http://127.0.0.1:1083 \
+#     -t deepswe-train:latest \
+#     -f ppio/scripts/Dockerfile.32h200 .
+#
+# rllm source is mounted at runtime via -v, not baked into image.
+# =============================================================================
+
+# Override vllm's default entrypoint (api_server)
+ENTRYPOINT ["/bin/bash"]
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl vim htop rsync openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install verl (RL training framework)
+RUN pip install --no-cache-dir "verl==0.6.1" "verl[vllm]"
+
+# Install Ray for multi-node cluster
+RUN pip install --no-cache-dir "ray[default]>=2.40"
+
+# Install R2E-Gym (SWE-Bench environment)
+# Force remove distutils-installed blinker that blocks R2E-Gym deps
+RUN pip install --no-cache-dir --ignore-installed blinker && \
+    pip install --no-cache-dir git+https://github.com/agentica-project/R2E-Gym.git
+
+# Install PPIO Sandbox SDK
+RUN pip install --no-cache-dir ppio_sandbox
+
+# Install rllm core dependencies + swe extras
+# (rllm itself is mounted at runtime via -v)
+RUN pip install --no-cache-dir \
+    transformers>=4.55.0 \
+    datasets>=2.20.0 \
+    pandas polars pillow numpy sympy \
+    pylatexenc "antlr4-python3-runtime==4.9.3" \
+    mcp eval-protocol \
+    hydra-core openai fastapi uvicorn \
+    tqdm PyYAML pydantic wrapt "asgiref>=3.7.0" wandb \
+    docker kubernetes swebench
+
+# Install Flash Attention 2 (required for FSDP training with Qwen3)
+# Pin numpy<2.3 to maintain compatibility with numba (required by vLLM)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation && \
+    pip install --no-cache-dir "numpy<2.3"
+
+# NCCL / vLLM defaults for multi-node training
+ENV NCCL_CUMEM_ENABLE=0
+ENV NCCL_DEBUG=WARN
+ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+ENV VLLM_USE_V1=1
+ENV VLLM_ATTENTION_BACKEND=FLASH_ATTN
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+
+WORKDIR /workspace
+CMD ["-c", "sleep infinity"]

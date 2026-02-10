@@ -209,15 +209,18 @@ class SandboxPool:
         self._max_retries: int = 5
         self._base_delay: float = 2.0  # Base delay for exponential backoff
         self._default_template: str = os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
+        self._sandbox_pause: bool = True  # Whether to pause/resume sandboxes between uses
 
-    def configure(self, api_key: str, pool_size: int = 32, timeout: int = 3600, template: str = None):
+    def configure(self, api_key: str, pool_size: int = 32, timeout: int = 3600,
+                  template: str = None, sandbox_pause: bool = True):
         """Configure the pool parameters."""
         self._api_key = api_key
         self._pool_size = pool_size
         self._timeout = timeout
+        self._sandbox_pause = sandbox_pause
         if template:
             self._default_template = template
-        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}")
+        print(f"[SandboxPool] Configured: pool_size={pool_size}, timeout={timeout}, sandbox_pause={sandbox_pause}")
 
     def get_sandbox(self, trajectory_idx: int, repo: str = "", workdir: str = DEFAULT_WORKDIR):
         """
@@ -244,9 +247,10 @@ class SandboxPool:
 
             if sandbox_idx in pool and pool[sandbox_idx] is not None:
                 sandbox = pool[sandbox_idx]
-                # Try to resume if paused
+                # Resume if sandbox was paused, otherwise just reuse
                 try:
-                    sandbox.connect()
+                    if self._sandbox_pause:
+                        sandbox.connect()
                     print(f"[SandboxPool] Reusing sandbox [{pool_key}][{sandbox_idx}] for trajectory {trajectory_idx}")
                     return sandbox, using_prebuilt
                 except Exception as e:
@@ -291,7 +295,7 @@ class SandboxPool:
     def release_sandbox(self, trajectory_idx: int, repo: str = "", pause: bool = True):
         """
         Release sandbox back to pool.
-        If pause=True, pause the sandbox to save resources.
+        If pause=True and sandbox_pause is enabled, pause the sandbox to save resources.
         """
         pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
@@ -302,7 +306,7 @@ class SandboxPool:
             pool = self._repo_pools[pool_key]
             if sandbox_idx in pool and pool[sandbox_idx] is not None:
                 sandbox = pool[sandbox_idx]
-                if pause:
+                if pause and self._sandbox_pause:
                     try:
                         sandbox.beta_pause()
                         print(f"[SandboxPool] Paused sandbox [{pool_key}][{sandbox_idx}]")
@@ -354,7 +358,7 @@ class PPIOSandboxManager:
 
     def __init__(self, api_key: str, timeout: int = 3600, workdir: str = DEFAULT_WORKDIR,
                  use_pool: bool = True, trajectory_idx: int = 0, pool_size: int = 32,
-                 template: str = None, repo: str = ""):
+                 template: str = None, repo: str = "", sandbox_pause: bool = True):
         self.api_key = api_key
         self.timeout = timeout
         self.workdir = workdir
@@ -363,6 +367,7 @@ class PPIOSandboxManager:
         self.trajectory_idx = trajectory_idx
         self.pool_size = pool_size
         self.repo = repo
+        self.sandbox_pause = sandbox_pause
         self.using_prebuilt = False  # Will be set when sandbox is created
         # Normalize R2E-Gym short names for template lookup
         full_repo = normalize_repo_name(repo)
@@ -372,7 +377,8 @@ class PPIOSandboxManager:
         # Configure pool if using it
         if use_pool:
             pool = get_sandbox_pool()
-            pool.configure(api_key, pool_size=pool_size, timeout=timeout, template=self.template)
+            pool.configure(api_key, pool_size=pool_size, timeout=timeout,
+                          template=self.template, sandbox_pause=sandbox_pause)
 
     def create_sandbox(self):
         """Create or get a sandbox from pool"""
