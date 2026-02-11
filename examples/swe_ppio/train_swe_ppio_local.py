@@ -172,15 +172,16 @@ async def run_single_rollout(
     max_steps: int = 50,
 ):
     """Run a single rollout for an instance."""
-    from rllm.environments.swe_ppio.swe_ppio import SWEBenchPPIOEnv
+    from rllm.environments.swe_ppio.swe_ppio_multistep import SWEBenchPPIOMultiStepEnv
     from rllm.agents.swe_agent import SWEAgent
 
-    env = SWEBenchPPIOEnv(
+    env = SWEBenchPPIOMultiStepEnv(
         entry=instance,
         timeout=3600,
         workdir="/testbed",
         use_pool=True,
         pool_size=32,
+        max_steps=max_steps,
     )
     agent = SWEAgent(
         use_fn_calling=False,
@@ -189,6 +190,7 @@ async def run_single_rollout(
 
     try:
         obs, info = await asyncio.to_thread(env.reset)
+        info["task"] = instance  # Add task for SWEAgent compatibility
         agent.update_from_env(obs["task_instruction"], 0, False, info)
 
         trajectory = []

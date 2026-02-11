@@ -189,7 +189,7 @@ class SWEAgent(BaseAgent):
             messages.append({"role": "system", "content": self.system_prompt})
 
             user_content = self.user_prompt_template.format(
-                issue=problem_statement,
+                problem_statement=problem_statement,
                 repo=repo,
                 base_commit=base_commit,
             )
