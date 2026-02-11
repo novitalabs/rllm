@@ -291,6 +291,7 @@ Can you help me implement the necessary changes to the repository to fix the <gi
 I've already taken care of all changes to any of the test files described in the <github_issue>. This means you DON'T have to modify the testing logic or any of the tests in any way!
 Your task is to make the minimal changes to non-tests files in the /testbed directory to ensure the <github_issue> is satisfied.
 
+Before making edits, use file_editor with command=view to understand the code context.
 Call the finish function with command=submit when you have completed the task.
 """
 
