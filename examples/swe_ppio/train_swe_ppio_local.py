@@ -3,15 +3,12 @@
 Local SWE-bench Training with PPIO Sandbox
 
 A simpler training script that doesn't require a full Ray cluster.
-Uses the same patterns as rft-tinker v3:
-- Checkpoint manager with JSON persistence
-- Retry with exponential backoff
-- GRPO advantage computation
+Uses HTTP API for inference (compatible with vLLM OpenAI server).
 
 This is useful for:
 - Development and testing
 - Small-scale experiments
-- Single-GPU training
+- Using existing inference servers
 
 For distributed training, use train_swe_ppio.sh instead.
 """
@@ -20,6 +17,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import requests
 import sys
 import time
 from dataclasses import dataclass, field
@@ -34,9 +33,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Inference Configuration
+# =============================================================================
+INFERENCE_URL = "http://localhost:8000/v1/chat/completions"
+MAX_TOKENS = 4096
+TEMPERATURE = 1.0
+
 # Rollout timeout to prevent hanging (45 min, safe within 1-hour sandbox limit)
 ROLLOUT_TIMEOUT = 2700
-
 
 
 # =============================================================================
@@ -119,14 +124,51 @@ def compute_grpo_advantages(rewards: List[float]) -> List[float]:
 
 
 # =============================================================================
+# HTTP API Inference
+# =============================================================================
+
+async def generate_response(messages: List[Dict], inference_url: str = None) -> str:
+    """Generate model response using HTTP API (vLLM OpenAI-compatible server)."""
+    url = inference_url or INFERENCE_URL
+
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            url,
+            json={
+                "messages": messages,
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMPERATURE,
+                "stop": ["</function>"],
+            },
+            timeout=300,
+            proxies={"http": None, "https": None},  # Disable proxy for localhost
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+
+        # Remove <think>...</think> tags (Qwen3 reasoning)
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        content = content.strip()
+
+        # Add back stop string if present in action but not terminated
+        if "<function=" in content and "</function>" not in content:
+            content += "</function>"
+
+        return content
+    except Exception as e:
+        logger.error(f"Inference failed: {e}")
+        raise
+
+
+# =============================================================================
 # Training Loop
 # =============================================================================
 
 async def run_single_rollout(
     instance: Dict,
     rollout_idx: int,
-    model,
-    tokenizer,
+    inference_url: str,
     max_steps: int = 50,
 ):
     """Run a single rollout for an instance."""
@@ -155,9 +197,9 @@ async def run_single_rollout(
 
         while not done and step < max_steps:
             messages = agent.chat_completions
-            response = await generate_response(model, tokenizer, messages)
+            response = await generate_response(messages, inference_url)
             action = agent.update_from_model(response)
-            logger.info(f"Model action (first 500 chars): {action.action[:500] if len(action.action) > 500 else action.action}")
+            logger.info(f"Step {step+1}: {action.action[:200] if len(action.action) > 200 else action.action}...")
             obs, reward, done, info = await asyncio.to_thread(env.step, action.action)
             agent.update_from_env(obs, reward, done, info)
 
@@ -170,6 +212,7 @@ async def run_single_rollout(
 
         final_reward = env.compute_final_reward()
         total_reward = sum(t["reward"] for t in trajectory) + final_reward
+        logger.info(f"Rollout {rollout_idx} completed: steps={step}, final_reward={final_reward}, total_reward={total_reward}")
 
         return {
             "reward": total_reward,
@@ -179,6 +222,8 @@ async def run_single_rollout(
         }
     except Exception as e:
         logger.error(f"Rollout {rollout_idx} failed: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "reward": 0.0,
             "trajectory": [],
@@ -193,8 +238,7 @@ async def run_single_rollout(
 async def train_batch(
     batch_idx: int,
     instances: List[Dict],
-    model,
-    tokenizer,
+    inference_url: str,
     group_size: int = 4,
     max_steps: int = 50,
     max_concurrent: int = 8,
@@ -208,7 +252,7 @@ async def train_batch(
         async with sem:
             try:
                 return await asyncio.wait_for(
-                    run_single_rollout(instance, idx, model, tokenizer, max_steps),
+                    run_single_rollout(instance, idx, inference_url, max_steps),
                     timeout=ROLLOUT_TIMEOUT
                 )
             except asyncio.TimeoutError:
@@ -265,90 +309,28 @@ async def train_batch(
     return batch_rewards, batch_trajectories
 
 
-def truncate_context(tokenizer, messages, max_tokens=60000):
-    """Truncate messages to fit within max_tokens, keeping system prompt and recent messages."""
-    if not messages:
-        return messages
-    
-    # Always keep system prompt if present
-    system_messages = []
-    other_messages = []
-    for msg in messages:
-        if msg.get('role') == 'system':
-            system_messages.append(msg)
-        else:
-            other_messages.append(msg)
-    
-    # Count tokens for full context
-    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    full_tokens = len(tokenizer.encode(full_text))
-    
-    logger.info(f"Context size: {full_tokens} tokens")
-    if full_tokens <= max_tokens:
-        return messages
-    
-    logger.warning(f'Context too long ({full_tokens} tokens), truncating to {max_tokens}')
-    
-    # Keep as many recent messages as possible
-    kept_messages = []
-    for msg in reversed(other_messages):
-        test_messages = system_messages + [msg] + kept_messages
-        test_text = tokenizer.apply_chat_template(test_messages, tokenize=False, add_generation_prompt=True)
-        if len(tokenizer.encode(test_text)) <= max_tokens:
-            kept_messages.insert(0, msg)
-        else:
-            break
-    
-    result = system_messages + kept_messages
-    logger.info(f'Truncated context from {len(messages)} to {len(result)} messages')
-    return result
-
-
-async def generate_response(model, tokenizer, messages):
-    """Generate model response using vLLM."""
-    # Truncate context if too long
-    messages = truncate_context(tokenizer, messages, max_tokens=60000)
-    
-    # Format messages into prompt
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Generate with vLLM
-    from vllm import SamplingParams
-    sampling_params = SamplingParams(
-        temperature=1.0,
-        max_tokens=4096,
-        stop=["</function>"],
-    )
-
-    outputs = await asyncio.to_thread(model.generate, [prompt], sampling_params)
-    response = outputs[0].outputs[0].text
-
-    # Add back stop string if present in action
-    if "<function=" in response and "</function>" not in response:
-        response += "</function>"
-
-    return response
-
-
 async def main():
     """Main training loop."""
+    global INFERENCE_URL
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--model-path", type=str, default="Qwen/Qwen3-32B")
+    parser.add_argument("--inference-url", type=str, default=INFERENCE_URL, help="Inference server URL")
     parser.add_argument("--num-batches", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=50)
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
-    parser.add_argument("--dry-run", action="store_true", help="Test without model loading")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85, help="GPU memory utilization")
-    parser.add_argument("--max-concurrent", type=int, default=16, help="Maximum concurrent rollouts")
+    parser.add_argument("--dry-run", action="store_true", help="Test without running rollouts")
+    parser.add_argument("--max-concurrent", type=int, default=8, help="Maximum concurrent rollouts")
+    parser.add_argument("--instance", type=str, default=None, help="Run single instance (for testing)")
     args = parser.parse_args()
 
+    INFERENCE_URL = args.inference_url
+
     logger.info(f"Starting SWE-PPIO local training")
-    logger.info(f"Model: {args.model_path}")
+    logger.info(f"Inference URL: {args.inference_url}")
     logger.info(f"Data: {args.data_path}")
     logger.info(f"Config: batch_size={args.batch_size}, group_size={args.group_size}, max_steps={args.max_steps}")
 
@@ -365,27 +347,34 @@ async def main():
     with open(args.data_path, "r") as f:
         for line in f:
             if line.strip():
-                instances.append(json.loads(line))
+                data = json.loads(line)
+                if args.instance is None or data.get("instance_id") == args.instance:
+                    instances.append(data)
+                    if args.instance:
+                        break
     logger.info(f"Loaded {len(instances)} instances")
 
+    if not instances:
+        logger.error(f"No instances found (filter: {args.instance})")
+        return
+
     if args.dry_run:
-        logger.info("Dry run mode - skipping model loading")
+        logger.info("Dry run mode - skipping rollouts")
         logger.info("Checkpoint manager and patterns demonstrated successfully")
         return
 
-    # Load model with vLLM
-    from vllm import LLM
-    from transformers import AutoTokenizer
-
-    logger.info(f"Loading model {args.model_path}...")
-    model = LLM(
-        model=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        trust_remote_code=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    logger.info("Model loaded successfully")
+    # Test inference server
+    try:
+        test_resp = requests.post(
+            args.inference_url,
+            json={"messages": [{"role": "user", "content": "test"}], "max_tokens": 5},
+            timeout=30,
+            proxies={"http": None, "https": None},
+        )
+        logger.info(f"Inference server OK: {test_resp.status_code}")
+    except Exception as e:
+        logger.error(f"Inference server not available at {args.inference_url}: {e}")
+        sys.exit(1)
 
     # Training loop
     for batch_idx in range(start_batch, args.num_batches):
@@ -405,8 +394,7 @@ async def main():
             rewards, trajectories = await train_batch(
                 batch_idx=batch_idx,
                 instances=batch_instances,
-                model=model,
-                tokenizer=tokenizer,
+                inference_url=args.inference_url,
                 group_size=args.group_size,
                 max_steps=args.max_steps,
                 max_concurrent=args.max_concurrent,
@@ -417,14 +405,17 @@ async def main():
             logger.info(f"Batch {batch_idx + 1} - Avg reward: {avg_reward:.4f}")
 
             # Compute GRPO advantages
-            advantages = compute_grpo_advantages(rewards)
-            logger.info(f"Advantages: min={min(advantages):.2f}, max={max(advantages):.2f}")
+            if len(rewards) > 1:
+                advantages = compute_grpo_advantages(rewards)
+                logger.info(f"Advantages: min={min(advantages):.2f}, max={max(advantages):.2f}")
 
             # Record checkpoint
             checkpoint_manager.record_batch(state, batch_idx + 1, avg_reward)
 
         except Exception as e:
             logger.error(f"Error in batch {batch_idx + 1}: {e}")
+            import traceback
+            traceback.print_exc()
             logger.info("Attempting to continue with next batch...")
             continue
 
