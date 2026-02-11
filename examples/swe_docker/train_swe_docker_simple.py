@@ -500,6 +500,7 @@ def run_rollout(instance: Dict, max_steps: int = 50) -> Dict:
 
 
 def main():
+    global INFERENCE_URL
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
@@ -508,7 +509,6 @@ def main():
     parser.add_argument("--inference-url", type=str, default=INFERENCE_URL)
     args = parser.parse_args()
 
-    global INFERENCE_URL
     INFERENCE_URL = args.inference_url
 
     # Load dataset
