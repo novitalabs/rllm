@@ -311,6 +311,7 @@ class AgentPPOTrainer(RayPPOTrainer):
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            print(f"DEBUG: entropys shape: {entropys.shape}, response_masks shape: {response_masks.shape}")
                             entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                             old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                             metrics.update(old_log_prob_metrics)
@@ -681,6 +682,10 @@ class AgentPPOTrainer(RayPPOTrainer):
         traj_mask = torch.nn.utils.rnn.pad_sequence(all_masks_list, batch_first=True, padding_value=0)
         traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
         traj_mask = traj_mask[:, :max_response_length]
+
+        print(f"DEBUG: traj_mask shape after pad_sequence: {traj_mask.shape}")
+        for i, m in enumerate(all_masks_list):
+            print(f"DEBUG: all_masks_list[{i}] shape: {m.shape}")
 
         # position_ids
         position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask

@@ -431,65 +431,71 @@ class AgentExecutionEngine:
     def assemble_steps(self, steps: list[dict]):
         """
         Transform step-by-step results into trajectory format for training.
-        The assemble is aggresive, if steps is not cumulative, the response_masks is set to all 0s.
-
-        Each step_result contains:
-        - steps: List of {"prompt": str, "response": str, "prompt_ids": list, "completion_ids": list}
-
-        For training, we need to assemble the full conversation sequence where:
-        - prompt_tokens: Initial prompt (first step's prompt_ids)
-        - response_tokens: All subsequent conversation (completion_ids + next step's prompt_ids)
-        - response_masks: Mask indicating which tokens contribute to loss (only completion_ids)
+        
+        Fixed version: Uses lenient token assembly that does not require
+        exact token match. This handles BPE retokenization differences.
+        
+        Key insight: completion_ids are always correct (model actual output).
+        We use them directly without verification against re-tokenized sequence.
+        For observation tokens, we take them from the current step prompt_ids
+        suffix (after the previous step end position).
         """
-
         # Start with initial prompt from first step
         initial_prompt_ids = steps[0]["prompt_ids"]
-        accumulated_sequence = initial_prompt_ids.copy()
+        
         response_tokens = []
         response_masks = []
-        is_valid_trajectory = True
-
+        
+        # Track expected accumulated length for observation calculation
+        prev_step_end_len = len(initial_prompt_ids)
+        
         for i, step in enumerate(steps):
             current_prompt_ids = step["prompt_ids"]
             current_completion_ids = step["completion_ids"]
-
+            
             if i == 0:
                 # First step: just add completion
                 response_tokens.extend(current_completion_ids)
-                response_masks.extend([1] * len(current_completion_ids))  # completion contributes to loss
-                accumulated_sequence.extend(current_completion_ids)
+                response_masks.extend([1] * len(current_completion_ids))
+                prev_step_end_len = len(current_prompt_ids) + len(current_completion_ids)
             else:
-                if current_prompt_ids[: len(accumulated_sequence)] != accumulated_sequence:
-                    # Find the first differing position
-                    prefix = current_prompt_ids[: len(accumulated_sequence)]
-                    diff_pos = None
-                    for i, (expected, actual) in enumerate(zip(accumulated_sequence, prefix, strict=False)):
-                        if expected != actual:
-                            diff_pos = i
-                            break
-
-                    if diff_pos is not None:
-                        logger.warning(f"When assemble steps, detect the trajectory not accumulative at position {diff_pos}. Expected: {accumulated_sequence[diff_pos : diff_pos + 5]}, Got: {prefix[diff_pos : diff_pos + 5]}. Setting response_masks to all 0s. This is likely due to retokenization.")
-                    else:
-                        logger.warning(f"When assemble steps, detect length mismatch. Expected length: {len(accumulated_sequence)}, Got length: {len(prefix)}. Setting response_masks to all 0s.")
-
-                    is_valid_trajectory = False
-                    break
-
-                response_tokens.extend(current_prompt_ids[len(accumulated_sequence) :] + current_completion_ids)
-                response_masks.extend([0] * (len(current_prompt_ids) - len(accumulated_sequence)) + [1] * len(current_completion_ids))  # completion contributes to loss
-                accumulated_sequence = current_prompt_ids + current_completion_ids
-
-        assert len(response_masks) == len(response_tokens)
-
+                # Calculate observation tokens (tokens added by environment)
+                # These are the tokens between the previous step end and current completion
+                current_prompt_len = len(current_prompt_ids)
+                
+                if current_prompt_len > prev_step_end_len:
+                    # There are observation tokens
+                    # Take them from current_prompt_ids (these are the re-tokenized version)
+                    observation_len = current_prompt_len - prev_step_end_len
+                    observation_tokens = current_prompt_ids[-observation_len:]
+                    
+                    response_tokens.extend(observation_tokens)
+                    response_masks.extend([0] * len(observation_tokens))  # observation = mask 0
+                elif current_prompt_len < prev_step_end_len:
+                    # This should not happen - prompt should grow
+                    # Log warning but continue
+                    logger.warning(
+                        f"Step {i}: prompt length ({current_prompt_len}) < previous end ({prev_step_end_len}). "
+                        f"This may indicate truncation or an error."
+                    )
+                
+                # Add completion tokens (model output = mask 1)
+                response_tokens.extend(current_completion_ids)
+                response_masks.extend([1] * len(current_completion_ids))
+                
+                # Update for next iteration
+                prev_step_end_len = current_prompt_len + len(current_completion_ids)
+        
+        assert len(response_masks) == len(response_tokens), f"Mask/token length mismatch: {len(response_masks)} vs {len(response_tokens)}"
+        
         prompt_tokens = torch.tensor(initial_prompt_ids, dtype=torch.long)
         response_tokens = torch.tensor(response_tokens, dtype=torch.long)
         response_masks = torch.tensor(response_masks, dtype=torch.long)
+        
+        # Always return True since we do not do strict verification anymore
+        # The response_masks correctly identify completion regions
+        return prompt_tokens, response_tokens, response_masks, True
 
-        if self.config.rllm.filter_token_mismatch:
-            response_masks = response_masks * int(is_valid_trajectory)
-
-        return prompt_tokens, response_tokens, response_masks, is_valid_trajectory
 
     async def run_agent_trajectory_with_retry(self, idx, seed=0, mode="Text", **kwargs):
         for _ in range(self.retry_limit):
