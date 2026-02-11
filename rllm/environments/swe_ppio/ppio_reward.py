@@ -98,7 +98,9 @@ class TestResult:
 # Pre-built PPIO Templates for SWE-bench repos
 # =============================================================================
 # These templates have repos pre-cloned at /testbed with dependencies installed
+# Use template IDs for templates without names
 REPO_TEMPLATE_MAP = {
+    # SWE-Bench validation repos (by name)
     "pallets/flask": "swebench-pallets-flask",
     "psf/requests": "swebench-psf-requests",
     "pytest-dev/pytest": "swebench-pytest-dev-pytest",
@@ -111,11 +113,60 @@ REPO_TEMPLATE_MAP = {
     "astropy/astropy": "swebench-astropy-astropy",
     "pydata/xarray": "swebench-pydata-xarray",
     "mwaskom/seaborn": "swebench-mwaskom-seaborn",
+    # R2E-Gym training repos (short name + full GitHub path)
+    "pandas": "r2e-pandas",
+    "pandas-dev/pandas": "r2e-pandas",
+    "numpy": "r2e-numpy",
+    "numpy/numpy": "r2e-numpy",
+    "pillow": "r2e-pillow",
+    "python-pillow/Pillow": "r2e-pillow",
+    "orange3": "r2e-orange3",
+    "biolab/orange3": "r2e-orange3",
+    "aiohttp": "r2e-aiohttp-v2",
+    "aio-libs/aiohttp": "r2e-aiohttp-v2",
+    "tornado": "r2e-tornado",
+    "tornadoweb/tornado": "r2e-tornado",
+    "scrapy": "r2e-scrapy",
+    "scrapy/scrapy": "r2e-scrapy",
+    "pyramid": "r2e-pyramid",
+    "Pylons/pyramid": "r2e-pyramid",
+    "datalad": "r2e-datalad-v2",
+    "datalad/datalad": "r2e-datalad-v2",
+    "coveragepy": "r2e-coveragepy",
+    "nedbat/coveragepy": "r2e-coveragepy",
 }
 
-# Default workdir for pre-built templates
-DEFAULT_WORKDIR = "/testbed"  # For pre-built templates
-FALLBACK_WORKDIR = "/code"   # For base template (writable directory)
+# Default workdir for pre-built templates (these have /testbed created with proper permissions)
+DEFAULT_WORKDIR = "/testbed"
+# Fallback workdir for base template (non-prebuilt) - uses /tmp which is writable
+FALLBACK_WORKDIR = "/tmp/testbed"
+
+# =============================================================================
+# R2E-Gym Short Name to Full GitHub Path Mapping
+# =============================================================================
+# R2E-Gym training data uses short repo names (e.g., "pandas") instead of
+# full GitHub paths (e.g., "pandas-dev/pandas"). This mapping converts them.
+R2E_GYM_REPO_MAP = {
+    "pandas": "pandas-dev/pandas",
+    "numpy": "numpy/numpy",
+    "pillow": "python-pillow/Pillow",
+    "orange3": "biolab/orange3",
+    "aiohttp": "aio-libs/aiohttp",
+    "tornado": "tornadoweb/tornado",
+    "scrapy": "scrapy/scrapy",
+    "pyramid": "Pylons/pyramid",
+    "datalad": "datalad/datalad",
+    "coveragepy": "nedbat/coveragepy",
+}
+
+
+def normalize_repo_name(repo: str) -> str:
+    """Convert R2E-Gym short repo name to full GitHub path if needed."""
+    if "/" in repo:
+        # Already a full path like "pandas-dev/pandas"
+        return repo
+    # Try R2E-Gym mapping
+    return R2E_GYM_REPO_MAP.get(repo, repo)
 
 
 # =============================================================================
@@ -173,13 +224,14 @@ class SandboxPool:
         Get a sandbox for the given trajectory index and repo.
         Uses per-repo pools with pre-built templates when available.
         """
-        # Normalize repo name for template lookup
-        normalized_repo = normalize_repo_name(repo)
-        # Determine template to use
-        template = REPO_TEMPLATE_MAP.get(normalized_repo, self._default_template)
-        using_prebuilt = normalized_repo in REPO_TEMPLATE_MAP
+        # Normalize R2E-Gym short names to full GitHub paths
+        full_repo = normalize_repo_name(repo)
 
-        # Use repo-specific pool key
+        # Determine template to use (check both short and full name)
+        template = REPO_TEMPLATE_MAP.get(repo) or REPO_TEMPLATE_MAP.get(full_repo) or self._default_template
+        using_prebuilt = repo in REPO_TEMPLATE_MAP or full_repo in REPO_TEMPLATE_MAP
+
+        # Use repo-specific pool key (use original name for consistency)
         pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
 
@@ -279,7 +331,10 @@ class SandboxPool:
     @property
     def active_count(self) -> int:
         with self._pool_lock:
-            return sum(1 for s in self._pool.values() if s is not None)
+            return sum(
+                1 for pool in self._repo_pools.values()
+                for s in pool.values() if s is not None
+            )
 
 
 # Global pool instance
@@ -302,21 +357,17 @@ class PPIOSandboxManager:
                  template: str = None, repo: str = ""):
         self.api_key = api_key
         self.timeout = timeout
-        # Auto-select workdir based on template
-        # Pre-built templates use /testbed, base template uses /code
-        normalized_repo = normalize_repo_name(repo)
-        if normalized_repo in REPO_TEMPLATE_MAP:
-            self.workdir = workdir  # /testbed for pre-built
-        else:
-            self.workdir = FALLBACK_WORKDIR  # /code for base template
+        self.workdir = workdir
         self.sandbox = None
         self.use_pool = use_pool
         self.trajectory_idx = trajectory_idx
         self.pool_size = pool_size
         self.repo = repo
         self.using_prebuilt = False  # Will be set when sandbox is created
+        # Normalize R2E-Gym short names for template lookup
+        full_repo = normalize_repo_name(repo)
         # Template: can be "base", repo-specific template, etc.
-        self.template = template or REPO_TEMPLATE_MAP.get(repo) or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
+        self.template = template or REPO_TEMPLATE_MAP.get(repo) or REPO_TEMPLATE_MAP.get(full_repo) or os.environ.get("PPIO_SANDBOX_TEMPLATE", "base")
 
         # Configure pool if using it
         if use_pool:
@@ -341,24 +392,40 @@ class PPIOSandboxManager:
             # Fix permissions and git safe.directory for pre-built templates
             self.sandbox.commands.run(f"chmod -R 777 {self.workdir} 2>/dev/null || true", timeout=30)
             self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
-            self.using_prebuilt = normalize_repo_name(self.repo) in REPO_TEMPLATE_MAP
+            full_repo = normalize_repo_name(self.repo)
+            self.using_prebuilt = self.repo in REPO_TEMPLATE_MAP or full_repo in REPO_TEMPLATE_MAP
+
+        # If not using pre-built template, switch to fallback workdir (writable by non-root)
+        if not self.using_prebuilt:
+            self.workdir = FALLBACK_WORKDIR
+            print(f"[PPIOSandboxManager] Using fallback workdir: {self.workdir}")
+            self.sandbox.commands.run(f"git config --global --add safe.directory {self.workdir}", timeout=10)
+
         return self.sandbox
 
-    def run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
-        """Public wrapper for running commands in sandbox"""
-        return self._run_command(cmd, timeout)
-
     def _run_command(self, cmd: str, timeout: int = 60) -> tuple[int, str]:
-        """Run command and return (exit_code, output), catching exceptions"""
+        """Run command and return (exit_code, output), catching exceptions.
+
+        PPIO SDK throws CommandExitException on non-zero exit codes.
+        CommandExitException inherits from CommandResult and has stdout,
+        stderr, exit_code attributes. We catch it and extract the full
+        stdout to match R2E-Gym's Docker runtime behavior (always returns
+        both output and exit code).
+        """
         try:
             result = self.sandbox.commands.run(cmd, timeout=timeout)
-            return result.exit_code, result.stdout
+            return result.exit_code, result.stdout or ''
         except Exception as e:
-            # CommandExitException includes exit code and error in message
+            # CommandExitException has stdout, stderr, exit_code attributes
+            stdout = getattr(e, 'stdout', None)
+            exit_code = getattr(e, 'exit_code', None)
+            if stdout is not None and exit_code is not None:
+                return exit_code, stdout
+            # Fallback for other exceptions
             error_str = str(e)
-            # Extract exit code if present
-            if "exit code" in error_str.lower():
-                return 1, error_str
+            stderr = getattr(e, 'stderr', '') or ''
+            if stderr:
+                error_str = f"{error_str}\nstderr: {stderr}"
             return 1, f"Command failed: {error_str}"
 
     def clone_repo(self, repo_url: str, commit: Optional[str] = None) -> tuple[bool, str]:
@@ -390,15 +457,24 @@ class PPIOSandboxManager:
             return True, "Success (pre-built template)"
 
         # Not using pre-built template: clone from scratch
-        # Clean up workdir first
-        # Create workdir first (ensure it exists before cd)
-        self._run_command(f"mkdir -p {self.workdir}", timeout=30)
-        # Clean up any existing contents
-        self._run_command(f"rm -rf {self.workdir}/* {self.workdir}/.[!.]* 2>/dev/null || true", timeout=30)
+        # Ensure workdir exists and clean it (must succeed before proceeding)
+        # Remove directory completely and recreate to ensure clean state for git clone
+        mkdir_cmd = f"rm -rf {self.workdir} 2>/dev/null; mkdir -p {self.workdir} && chmod 777 {self.workdir}"
+        exit_code, output = self._run_command(mkdir_cmd, timeout=30)
+        print(f"[PPIOSandboxManager] mkdir result: exit_code={exit_code}, output={output}")
+        if exit_code != 0:
+            return False, f"Failed to create workdir: {output}"
+
+        # Check if git is available
+        git_check_code, git_version = self._run_command("git --version 2>&1", timeout=10)
+        print(f"[PPIOSandboxManager] Git check: exit_code={git_check_code}, output={git_version}")
+        if git_check_code != 0:
+            return False, f"Git not available: {git_version}"
 
         if commit and commit != "HEAD":
             # For specific commits, need full clone or fetch
-            cmd = f"cd {self.workdir} && git clone {repo_url} . 2>&1"
+            # Use GIT_CURL_VERBOSE and GIT_TRACE for debugging
+            cmd = f"cd {self.workdir} && GIT_TRACE=1 git clone {repo_url} . 2>&1"
             exit_code, output = self._run_command(cmd, timeout=300)
             if exit_code != 0:
                 return False, f"Clone failed (exit={exit_code}): {output}"
@@ -490,72 +566,208 @@ class PPIOSandboxManager:
 
 
 # =============================================================================
-# Test Output Parser
+# Test Output Parser (aligned with R2E-Gym parse_log_pytest)
 # =============================================================================
-def parse_pytest_output(output: str, fail_to_pass: list, pass_to_pass: list) -> TestResult:
-    """Parse pytest output and categorize test results"""
-    # Initialize result tracking
+def _decolor(text: str) -> str:
+    """Remove ANSI escape codes from text."""
+    return re.sub(r"\x1b\[[0-9;]*m|\r", "", text)
+
+
+def _parse_log_pytest(log: str) -> dict:
+    """Parse pytest log output into {test_name: status} dict.
+
+    Aligned with R2E-Gym's parse_log_pytest from execution_log_parser.py.
+    Parses the 'short test summary info' section of pytest output.
+    """
+    if not log:
+        return {}
+
+    test_status_map = {}
+
+    # Prefer parsing from "short test summary info" section (R2E-Gym approach)
+    if "short test summary info" in log:
+        summary = log.split("short test summary info")[1].strip()
+        for line in summary.split("\n"):
+            line = _decolor(line).strip()
+            if "PASSED" in line and "::" in line:
+                # Format: PASSED path/to/test.py::TestClass::test_method
+                # Extract after first "::" and join with "."
+                test_name = ".".join(line.split("::")[1:]).strip()
+                # Clean trailing whitespace/status from test name
+                test_name = test_name.split(" PASSED")[0].strip() if " PASSED" in test_name else test_name
+                if test_name:
+                    test_status_map[test_name] = "PASSED"
+            elif "FAILED" in line and "::" in line:
+                test_name = ".".join(line.split("::")[1:]).split(" - ")[0].strip()
+                test_name = test_name.split(" FAILED")[0].strip() if " FAILED" in test_name else test_name
+                if test_name:
+                    test_status_map[test_name] = "FAILED"
+            elif "ERROR" in line and "::" in line:
+                try:
+                    test_name = ".".join(line.split("::")[1:]).split(" - ")[0].strip()
+                    test_name = test_name.split(" ERROR")[0].strip() if " ERROR" in test_name else test_name
+                except IndexError:
+                    test_name = line
+                if test_name:
+                    test_status_map[test_name] = "ERROR"
+    else:
+        # Fallback: parse all lines with :: and PASSED/FAILED/ERROR
+        for line in log.split("\n"):
+            line = _decolor(line).strip()
+            if "::" in line and (" PASSED" in line or " FAILED" in line or " ERROR" in line):
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Keep full path::name format as well for matching
+                    full_name = parts[0]
+                    # Also extract dotted name
+                    dotted_name = ".".join(full_name.split("::")[1:]) if "::" in full_name else full_name
+                    status = "PASSED" if "PASSED" in parts[1] else ("FAILED" if "FAILED" in parts[1] else "ERROR")
+                    test_status_map[full_name] = status
+                    if dotted_name and dotted_name != full_name:
+                        test_status_map[dotted_name] = status
+
+    return test_status_map
+
+
+def _match_test_name(expected_name: str, parsed_results: dict) -> Optional[str]:
+    """Find matching test name in parsed results, trying multiple formats.
+
+    Args:
+        expected_name: Test name from FAIL_TO_PASS or PASS_TO_PASS list
+        parsed_results: Dict of {parsed_test_name: status}
+
+    Returns:
+        The status string ("PASSED", "FAILED", "ERROR") or None if not found
+    """
+    # Direct match
+    if expected_name in parsed_results:
+        return parsed_results[expected_name]
+
+    # Try dotted format: "path/test.py::Class::method" → "Class.method"
+    if "::" in expected_name:
+        dotted = ".".join(expected_name.split("::")[1:])
+        if dotted in parsed_results:
+            return parsed_results[dotted]
+
+    # Try substring matching (expected is substring of parsed or vice versa)
+    for result_name, status in parsed_results.items():
+        if expected_name in result_name or result_name in expected_name:
+            return status
+
+    # Try matching just the test function name
+    expected_func = expected_name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+    for result_name, status in parsed_results.items():
+        result_func = result_name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        if expected_func == result_func and expected_func:
+            return status
+
+    return None
+
+
+def parse_pytest_output(output: str, fail_to_pass: list, pass_to_pass: list, repo: str = "") -> TestResult:
+    """Parse test output and categorize test results.
+
+    Uses swebench.harness.log_parsers.MAP_REPO_TO_PARSER for repo-specific
+    parsing (Django uses unittest format, sympy has its own format, etc.)
+    and swebench.harness.grading for standardized evaluation matching
+    SWE-bench's official grading logic.
+
+    Args:
+        output: Raw test output from running the test command
+        fail_to_pass: List of test names expected to change from fail to pass
+        pass_to_pass: List of test names expected to remain passing
+        repo: Repository name (e.g., "django/django") for parser selection
+    """
+    try:
+        from swebench.harness.log_parsers import MAP_REPO_TO_PARSER as SWEBENCH_PARSERS
+        from swebench.harness.grading import get_eval_tests_report, get_resolution_status
+        from swebench.harness.constants import (
+            ResolvedStatus, TestStatus,
+            FAIL_TO_PASS as F2P_KEY, PASS_TO_PASS as P2P_KEY,
+        )
+
+        # Get repo-specific parser (parsers don't actually use test_spec parameter)
+        parser = SWEBENCH_PARSERS.get(repo)
+        if parser is not None:
+            eval_status_map = parser(output, None)
+        else:
+            # Repo not in swebench parsers, use default pytest parser
+            eval_status_map = SWEBENCH_PARSERS["pytest-dev/pytest"](output, None)
+
+        # Use swebench grading for standard evaluation
+        gold_results = {
+            F2P_KEY: fail_to_pass,
+            P2P_KEY: pass_to_pass,
+        }
+        report = get_eval_tests_report(eval_status_map, gold_results)
+        resolved = get_resolution_status(report) == ResolvedStatus.FULL.value
+
+        f2p_success = report[F2P_KEY]["success"]
+        f2p_failure = report[F2P_KEY]["failure"]
+        p2p_success = report[P2P_KEY]["success"]
+        p2p_failure = report[P2P_KEY]["failure"]
+
+        passed = sum(1 for v in eval_status_map.values() if v in (TestStatus.PASSED.value, TestStatus.XFAIL.value))
+        failed = sum(1 for v in eval_status_map.values() if v in (TestStatus.FAILED.value, TestStatus.ERROR.value))
+        errors = sum(1 for v in eval_status_map.values() if v == TestStatus.ERROR.value)
+
+        return TestResult(
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            total=len(eval_status_map),
+            f2p_success=f2p_success,
+            f2p_failure=f2p_failure,
+            p2p_success=p2p_success,
+            p2p_failure=p2p_failure,
+            resolved=resolved,
+            test_output=output,
+        )
+    except Exception as e:
+        print(f"[parse_pytest_output] swebench parser error: {e}, falling back to basic parser")
+        return _parse_pytest_output_basic(output, fail_to_pass, pass_to_pass)
+
+
+def _parse_pytest_output_basic(output: str, fail_to_pass: list, pass_to_pass: list) -> TestResult:
+    """Fallback parser when swebench parsers are not available."""
+    parsed_results = _parse_log_pytest(output)
+
     f2p_success = []
     f2p_failure = []
     p2p_success = []
     p2p_failure = []
 
-    # Parse individual test results
-    test_results = {}
-    for line in output.split('\n'):
-        line = line.strip()
-        # Match patterns like "test_file.py::test_name PASSED" or "FAILED"
-        if '::' in line and (' PASSED' in line or ' FAILED' in line or ' ERROR' in line):
-            parts = line.split()
-            if len(parts) >= 2:
-                test_name = parts[0]
-                status = parts[1] if len(parts) > 1 else "UNKNOWN"
-                # Normalize test name (remove module prefix variations)
-                test_results[test_name] = status == "PASSED"
-
-    # Categorize tests
     for test in fail_to_pass:
-        # Check if test passed (try different name formats)
-        passed = False
-        for result_name, result_passed in test_results.items():
-            if test in result_name or result_name in test:
-                passed = result_passed
-                break
-        if passed:
+        status = _match_test_name(test, parsed_results)
+        if status == "PASSED":
             f2p_success.append(test)
         else:
             f2p_failure.append(test)
 
     for test in pass_to_pass:
-        # Check if test still passes
-        passed = True  # Default to pass if not found
-        for result_name, result_passed in test_results.items():
-            if test in result_name or result_name in test:
-                passed = result_passed
-                break
-        if passed:
+        status = _match_test_name(test, parsed_results)
+        if status is None:
+            p2p_success.append(test)
+        elif status == "PASSED":
             p2p_success.append(test)
         else:
             p2p_failure.append(test)
 
-    # Calculate totals from parsed output
-    passed = sum(1 for v in test_results.values() if v)
-    failed = sum(1 for v in test_results.values() if not v)
-
-    # Check if resolved: all FAIL_TO_PASS must pass, no PASS_TO_PASS can fail
+    passed = sum(1 for v in parsed_results.values() if v == "PASSED")
+    failed = sum(1 for v in parsed_results.values() if v in ("FAILED", "ERROR"))
     resolved = (len(f2p_failure) == 0 and len(p2p_failure) == 0 and len(f2p_success) > 0)
 
     return TestResult(
         passed=passed,
         failed=failed,
-        errors=0,
-        total=passed + failed,
+        errors=sum(1 for v in parsed_results.values() if v == "ERROR"),
+        total=len(parsed_results),
         f2p_success=f2p_success,
         f2p_failure=f2p_failure,
         p2p_success=p2p_success,
         p2p_failure=p2p_failure,
         resolved=resolved,
-        test_output=output
+        test_output=output,
     )
 
 
@@ -676,19 +888,40 @@ def swebench_ppio_reward_fn(task_info: dict, action: str) -> RewardOutput:
                 "error": "Failed to install dependencies"
             })
 
-        # Build test command from FAIL_TO_PASS tests
-        if fail_to_pass:
-            tests_to_run = " ".join(fail_to_pass)
-            full_test_cmd = f"{test_cmd} {tests_to_run}"
+        # Build and run eval script using swebench TestSpec (matches Standard flow)
+        from .swe_ppio_multistep import build_eval_script
+        eval_script, test_cmd_full = build_eval_script(task_info)
+        eval_script = eval_script.replace("__WORKDIR__", manager.workdir)
+
+        # Write eval script to sandbox
+        import base64
+        eval_path = f"{manager.workdir}/_eval.sh"
+        script_b64 = base64.b64encode(eval_script.encode()).decode()
+        manager._run_command(
+            f"echo '{script_b64}' | base64 -d > {eval_path} && chmod +x {eval_path}",
+            timeout=30
+        )
+
+        # Run eval script
+        print(f"[{instance_id}] Running eval script (test_cmd: {test_cmd_full})")
+        exit_code, output = manager._run_command(
+            f"cd {manager.workdir} && bash {eval_path} 2>&1",
+            timeout=1800
+        )
+        manager._run_command(f"rm -f {eval_path}", timeout=10)
+
+        # Extract test output between markers
+        start_marker = ">>>>> Start Test Output"
+        end_marker = ">>>>> End Test Output"
+        if start_marker in output:
+            test_output = output.split(start_marker, 1)[1]
+            if end_marker in test_output:
+                test_output = test_output.split(end_marker, 1)[0]
         else:
-            full_test_cmd = test_cmd
+            test_output = output
 
-        # Run tests
-        print(f"[{instance_id}] Running tests: {full_test_cmd}")
-        exit_code, test_output = manager.run_tests(full_test_cmd, timeout=1800)
-
-        # Parse results
-        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass)
+        # Parse results using repo-specific swebench parser
+        result = parse_pytest_output(test_output, fail_to_pass, pass_to_pass, repo=repo)
 
         # Calculate reward
         # Full resolution = 1.0, partial = proportion of tests passed
@@ -756,25 +989,3 @@ diff --git a/src/click/core.py b/src/click/core.py
     print("Testing PPIO SWE-bench reward function...")
     result = swebench_ppio_reward_fn(task_info, action)
     print(f"\nResult: {result}")
-
-
-# Mapping of short repo names to full GitHub org/repo format
-REPO_NAME_MAP = {
-    "pandas": "pandas-dev/pandas",
-    "numpy": "numpy/numpy",
-    "pillow": "python-pillow/Pillow",
-    "orange3": "biolab/orange3",
-    "aiohttp": "aio-libs/aiohttp",
-    "tornado": "tornadoweb/tornado",
-    "scrapy": "scrapy/scrapy",
-    "pyramid": "Pylons/pyramid",
-    "datalad": "datalad/datalad",
-    "coveragepy": "nedbat/coveragepy",
-}
-
-
-def normalize_repo_name(repo: str) -> str:
-    """Convert short repo names to full GitHub org/repo format."""
-    if "/" in repo:
-        return repo  # Already full format
-    return REPO_NAME_MAP.get(repo, repo)
