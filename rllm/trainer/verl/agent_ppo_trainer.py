@@ -311,6 +311,13 @@ class AgentPPOTrainer(RayPPOTrainer):
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            
+                            # Check if entropys is empty (vLLM compute_log_prob returned empty)
+                            if entropys.numel() == 0:
+                                print(f"WARNING: entropys is empty (numel=0). Skipping this step.")
+                                metrics["batch/skipped_empty_entropys"] = 1
+                                self.global_steps += 1
+                                continue
                             print(f"DEBUG: entropys shape: {entropys.shape}, response_masks shape: {response_masks.shape}")
                             entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                             old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
