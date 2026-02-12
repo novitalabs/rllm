@@ -1,65 +1,36 @@
 #!/bin/bash
-# Pull R2E-Gym Docker images with conservative rate limiting
-# Adds 60s delay between each pull to avoid 429 errors
-# Usage: ./pull_r2e_images_slow.sh [start_index] [end_index]
-
-set -e
+# Slow pull: 30 pulls/hour = 120s between pulls
 
 IMAGES_FILE="/home/claude/work/rllm-origin/r2e_gym_images.txt"
-LOG_DIR="/home/claude/work/logs/docker_pull"
-DELAY_SECONDS=60  # Wait 60s between pulls
-
+LOG_FILE="/home/claude/work/logs/docker_pull/slow_pull.log"
 START_IDX=${1:-0}
-END_IDX=${2:-$(wc -l < "$IMAGES_FILE")}
-END_IDX=$((END_IDX - 1))
+DELAY=${2:-120}  # 120s = 30 pulls/hour
 
-mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-PROGRESS_FILE="$LOG_DIR/progress_slow_${START_IDX}_${END_IDX}_${TIMESTAMP}.log"
+echo "=== Slow Docker Pull (30/hour) ===" | tee -a "$LOG_FILE"
+echo "Start index: $START_IDX, Delay: ${DELAY}s" | tee -a "$LOG_FILE"
+echo "Started at $(date)" | tee -a "$LOG_FILE"
 
-echo "=== R2E-Gym Slow Puller (60s delay) ==="
-echo "Range: $START_IDX to $END_IDX"
-echo "Progress log: $PROGRESS_FILE"
-echo ""
-
-mapfile -t ALL_IMAGES < "$IMAGES_FILE"
-TOTAL=$((END_IDX - START_IDX + 1))
-CURRENT=0
-PULLED=0
-SKIPPED=0
-
-for i in $(seq $START_IDX $END_IDX); do
-    image="${ALL_IMAGES[$i]}"
-    CURRENT=$((CURRENT + 1))
-    
-    echo -n "[$CURRENT/$TOTAL] $image ... "
+i=0
+while IFS= read -r image; do
+    if [ $i -lt $START_IDX ]; then
+        i=$((i + 1))
+        continue
+    fi
     
     if docker image inspect "$image" > /dev/null 2>&1; then
-        echo "SKIP (exists)"
-        SKIPPED=$((SKIPPED + 1))
+        echo "[$i] SKIP: ${image##*/}" | tee -a "$LOG_FILE"
     else
+        echo "[$i] PULL: ${image##*/}" | tee -a "$LOG_FILE"
         if docker pull "$image" > /dev/null 2>&1; then
-            echo "OK"
-            PULLED=$((PULLED + 1))
-            echo "$i,$image,OK" >> "$PROGRESS_FILE"
-            # Wait before next pull to avoid rate limit
-            if [ $CURRENT -lt $TOTAL ]; then
-                echo "   Waiting ${DELAY_SECONDS}s before next pull..."
-                sleep $DELAY_SECONDS
-            fi
+            echo "[$i] OK" | tee -a "$LOG_FILE"
         else
-            echo "RETRY after 120s..."
-            sleep 120
-            if docker pull "$image" > /dev/null 2>&1; then
-                echo "   OK (retry)"
-                PULLED=$((PULLED + 1))
-            else
-                echo "   FAILED"
-            fi
+            echo "[$i] FAILED (will retry later)" | tee -a "$LOG_FILE"
         fi
+        # Wait only after actual pull attempt (not skip)
+        echo "[$i] Waiting ${DELAY}s..." | tee -a "$LOG_FILE"
+        sleep $DELAY
     fi
-done
+    i=$((i + 1))
+done < "$IMAGES_FILE"
 
-echo ""
-echo "=== Summary ==="
-echo "Pulled: $PULLED, Skipped: $SKIPPED"
+echo "Done at $(date)" | tee -a "$LOG_FILE"
