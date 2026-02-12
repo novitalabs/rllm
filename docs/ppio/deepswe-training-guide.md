@@ -12,6 +12,8 @@ This document summarizes the experiments, issues encountered, and solutions foun
 | Feb 11 | Created R2EGymAgent with detailed prompts | Success rate improved from 0% to 75% |
 | Feb 11 | Fixed empty entropys issue | log_prob_micro_batch_size_per_gpu=1 is required |
 | Feb 12 | Multi-node training (16 GPUs) | Stable training with all fixes applied |
+| Feb 12 | Cross-node FSDP slowdown discovered | PPO update 2+ hours → 57s with Option B |
+| Feb 12 | Ray duplicate node NCCL error | Fixed by restarting Ray cluster properly |
 
 ---
 
@@ -184,6 +186,74 @@ rllm.filter_token_mismatch=False
 
 ---
 
+### 10. Cross-Node FSDP Slowdown (2+ hours PPO update)
+
+**Problem**: With 2-node training (nnodes=2), PPO update phase took 2+ hours instead of ~50 seconds.
+
+**Root Cause**: FSDP's All-Gather and Reduce-Scatter operations use Ethernet (~25 GB/s) for cross-node communication instead of NVLink (~600 GB/s). With `ulysses_sequence_parallel_size=16`, FSDP shards data across both nodes.
+
+**Symptoms**:
+- youyun.37: 0% GPU utilization (intermittent brief activity)
+- youyun.38: 64-92% GPU utilization (FSDP workers active)
+- Each of 64 transformer layers requires multiple cross-node syncs
+
+**Solution (Option B)**: Keep cross-node rollout (TP=16) but restrict FSDP to single node (Ulysses=8):
+```bash
+# Before (SLOW - cross-node FSDP)
+actor_rollout_ref.actor.ulysses_sequence_parallel_size=16  # Uses both nodes
+
+# After (FAST - single-node FSDP)
+actor_rollout_ref.actor.ulysses_sequence_parallel_size=8   # Single node only
+actor_rollout_ref.rollout.tensor_model_parallel_size=16    # Cross-node rollout OK
+```
+
+**Performance Comparison**:
+| Configuration | PPO Update Time |
+|--------------|-----------------|
+| Ulysses=16 (cross-node FSDP) | 2+ hours |
+| Ulysses=8 (single-node FSDP) | **57 seconds** |
+
+---
+
+### 11. Ray Duplicate Node NCCL Error
+
+**Problem**: Training crashed with NCCL error:
+```
+torch.distributed.DistBackendError: NCCL error
+Duplicate GPU detected : rank 5 and rank 13 both on CUDA device ab000
+```
+
+**Root Cause**: Worker node (youyun.38) registered twice in Ray cluster, resulting in 3 nodes with 24 GPUs instead of 2 nodes with 16 GPUs.
+
+**Diagnosis**:
+```bash
+ray list nodes  # Shows 3 nodes, 2 on same IP
+```
+
+**Solution**: Stop Ray on both machines and restart properly:
+```bash
+# Stop Ray on both nodes
+ssh youyun.37 "source ~/work/rllm/.venv/bin/activate && ray stop --force"
+ssh youyun.38 "source ~/work/rllm/.venv/bin/activate && ray stop --force"
+
+# Restart head node
+ssh youyun.37 "source ~/work/rllm/.venv/bin/activate && ray start --head --port=6379 --num-gpus=8"
+
+# Restart worker node (ONLY ONCE)
+ssh youyun.38 "source ~/work/rllm/.venv/bin/activate && ray start --address='10.83.115.10:6379' --num-gpus=8"
+
+# Verify: should show exactly 2 nodes, 16 GPUs
+ray status
+```
+
+**Prevention**: Always verify Ray cluster state before starting training:
+```bash
+ray status | grep -E "Total Usage|GPU"
+# Expected: 0.0/16.0 GPU
+```
+
+---
+
 ## Recommended Training Configuration
 
 ```bash
@@ -197,14 +267,15 @@ actor_rollout_ref.actor.clip_ratio_high=0.28
 actor_rollout_ref.actor.entropy_coeff=0.0
 algorithm.kl_ctrl.kl_coef=0.001
 
-# Rollout (vLLM)
+# Rollout (vLLM) - Cross-node TP=16 for 2-node setup
 actor_rollout_ref.rollout.name=vllm
 actor_rollout_ref.rollout.mode=async
-actor_rollout_ref.rollout.tensor_model_parallel_size=8
+actor_rollout_ref.rollout.tensor_model_parallel_size=16  # Cross-node OK
 actor_rollout_ref.rollout.enforce_eager=True
-actor_rollout_ref.rollout.gpu_memory_utilization=0.35
+actor_rollout_ref.rollout.gpu_memory_utilization=0.6
 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
 actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+actor_rollout_ref.rollout.n=8  # 8 rollouts per prompt
 
 # Actor (FSDP Training)
 actor_rollout_ref.actor.ulysses_sequence_parallel_size=8
@@ -308,4 +379,7 @@ ssh youyun.37 "source ~/work/rllm/.venv/bin/activate && ray status"
 - **2026-02-11**: Created R2EGymAgent, fixed empty batch crashes
 - **2026-02-11**: Found log_prob_micro_batch_size fix for empty entropys
 - **2026-02-12**: Multi-node training (16 GPUs) stable with all fixes
+- **2026-02-12**: Discovered cross-node FSDP slowdown (2+ hours PPO)
+- **2026-02-12**: Implemented Option B (TP=16 rollout + Ulysses=8 FSDP) - 57s PPO
+- **2026-02-12**: Fixed Ray duplicate node NCCL error
 - **2026-02-12**: Documented all issues and solutions (Docker-only)
