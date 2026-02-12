@@ -35,7 +35,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     data.train_files=${RLLM_DIR}/rllm/data/datasets/R2E_Gym_Subset/train_verl.parquet \
     data.val_files=${RLLM_DIR}/rllm/data/datasets/SWE_Bench_Verified/test_verl.parquet \
     data.train_batch_size=4 \
-    data.val_batch_size=4 \
+    data.val_batch_size=32 \
     data.max_prompt_length=32768 \
     data.max_response_length=32768 \
     data.filter_overlong_prompts=True \
@@ -63,7 +63,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=0.95 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
