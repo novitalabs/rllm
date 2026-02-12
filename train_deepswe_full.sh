@@ -80,7 +80,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=2 \
-    trainer.save_freq=10 \
+    trainer.save_freq=2 \
     trainer.test_freq=10 \
     trainer.default_hdfs_dir=null \
     rllm.env.name=swe \
