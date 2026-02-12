@@ -81,8 +81,9 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=2 \
     trainer.save_freq=2 \
-    trainer.test_freq=10 \
+    trainer.test_freq=20 \
     trainer.default_hdfs_dir=null \
+    trainer.default_local_dir=/home/claude/work/rllm-origin/checkpoints/\${trainer.project_name}/\${trainer.experiment_name} \
     rllm.env.name=swe \
     +rllm.env.env_args.backend=docker \
     +rllm.env.env_args.scaffold=r2egym \
