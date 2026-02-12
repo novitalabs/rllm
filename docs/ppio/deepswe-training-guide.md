@@ -8,7 +8,6 @@ This document summarizes the experiments, issues encountered, and solutions foun
 |------|----------|-------------|
 | Feb 9 | Docker-based training test | Successfully resolved astropy issue with reward=1.0 |
 | Feb 10 | Fixed pytest quoting bug for Django | Evaluation accuracy jumped from 17% to 75% |
-| Feb 10 | youyun K8s cluster setup | 4-node cluster with 32x H200 GPUs discovered |
 | Feb 11 | Started verl/rllm training on youyun.37/38 | TMA errors, disk full, rate limiting issues |
 | Feb 11 | Created R2EGymAgent with detailed prompts | Success rate improved from 0% to 75% |
 | Feb 11 | Fixed empty entropys issue | log_prob_micro_batch_size_per_gpu=1 is required |
