@@ -17,7 +17,7 @@ export WANDB_MODE=disabled
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export NCCL_NVLS_ENABLE=0
-export NCCL_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=b_manage0
 
 source $RLLM_DIR/.venv/bin/activate
 
