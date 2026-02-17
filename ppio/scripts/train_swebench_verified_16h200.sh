@@ -3,16 +3,20 @@ set -x
 
 # =============================================================================
 # DeepSWE Training Script for 16x H200 GPUs (2 nodes x 8 GPUs)
+# Dataset: SWE-Bench Verified (500 samples, 100% PPIO template coverage)
 # Model: Qwen3-32B
-# Nodes: 111.6.123.35 (HEAD) + 111.6.123.36 (Worker)
+#
+# Based on train_swebench_verified.sh (single-node) adapted for 2-node setup.
+# Uses SWE-Bench Verified for both train and val to avoid R2E-Gym checkout
+# failures on PPIO sandbox.
 #
 # Prerequisites:
 #   - Ray cluster running across 2 nodes (see setup_32h200_cluster.sh)
-#   - Run this script from the head node (111.6.123.35) inside Docker container
+#   - Run this script from the head node inside Docker container
 #
 # Usage:
 #   export PPIO_API_KEY=sk_xxxxx
-#   bash ppio/scripts/train_qwen3_32b_16h200.sh
+#   bash ppio/scripts/train_swebench_verified_16h200.sh
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +24,7 @@ export RLLM_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 export PYTHONPATH="$RLLM_DIR:$PYTHONPATH"
 
 echo "=============================================="
-echo "DeepSWE Training - 16x H200 (2 nodes x 8 GPUs)"
+echo "DeepSWE Training - SWE-Bench Verified - 16x H200 (2 nodes x 8 GPUs)"
 echo "RLLM_DIR: $RLLM_DIR"
 echo "=============================================="
 
@@ -96,14 +100,16 @@ echo "Ray cluster OK."
 
 # -----------------------------------------------------------------------------
 # Data Preparation
+# SWE-Bench Verified: 500 samples with 100% PPIO sandbox template coverage
+# Use same dataset for both train and val
 # -----------------------------------------------------------------------------
 
-TRAIN_DATA="${RLLM_DIR}/data/swe/R2E_Gym_Subset.parquet"
+TRAIN_DATA="${RLLM_DIR}/data/swe/SWE_Bench_Verified.parquet"
 VAL_DATA="${RLLM_DIR}/data/swe/SWE_Bench_Verified.parquet"
 
 if [ ! -f "$TRAIN_DATA" ]; then
     echo "Training data not found: $TRAIN_DATA"
-    echo "Please ensure data/swe/ parquet files are synced to this node."
+    echo "Please ensure data/swe/SWE_Bench_Verified.parquet is synced to this node."
     exit 1
 fi
 
@@ -133,13 +139,14 @@ N_GPUS_PER_NODE=8
 TENSOR_PARALLEL=8
 SEQUENCE_PARALLEL=8
 
-# Batch sizes - scaled 2x from single node (8 -> 16)
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+# Batch sizes — keep moderate for 500-sample dataset
+# With 500 samples and batch_size=8, ~62 steps per epoch
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 ROLLOUT_N=${ROLLOUT_N:-8}
 
-# Sequence lengths
-MAX_PROMPT_LENGTH=4096
+# Sequence lengths — match train_swebench_verified.sh
+MAX_PROMPT_LENGTH=8192
 MAX_RESPONSE_LENGTH=32768
 
 # Memory settings (H200 has 141GB HBM3e)
@@ -147,18 +154,20 @@ GPU_MEMORY_UTILIZATION=0.7
 PPO_MAX_TOKEN_LEN_PER_GPU=32000
 
 # Checkpoint and logging
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-32b-16h200-v1}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/data/checkpoints/deepswe-16h200/${EXPERIMENT_NAME}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-32b-swebench-16h200-v1}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-/data/checkpoints/deepswe-swebench-16h200/${EXPERIMENT_NAME}}"
 SAVE_FREQ=${SAVE_FREQ:-5}
 TEST_FREQ=${TEST_FREQ:-5}
 
 echo "=============================================="
 echo "Model: $MODEL"
+echo "Dataset: SWE-Bench Verified (500 samples)"
 echo "Nodes: $NNODES x ${N_GPUS_PER_NODE} GPUs = $((NNODES * N_GPUS_PER_NODE)) total"
 echo "Tensor Parallel: $TENSOR_PARALLEL"
 echo "Sequence Parallel: $SEQUENCE_PARALLEL"
 echo "Batch Size: $TRAIN_BATCH_SIZE"
 echo "Rollout N: $ROLLOUT_N"
+echo "Max Prompt Length: $MAX_PROMPT_LENGTH"
 echo "Max Response Length: $MAX_RESPONSE_LENGTH"
 echo "Checkpoint Dir: $CHECKPOINT_DIR"
 echo "Experiment: $EXPERIMENT_NAME"
@@ -174,7 +183,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
-    data.val_batch_size=256 \
+    data.val_batch_size=64 \
     data.max_prompt_length=$MAX_PROMPT_LENGTH \
     data.max_response_length=$MAX_RESPONSE_LENGTH \
     data.filter_overlong_prompts=True \
@@ -213,7 +222,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     rllm.mask_truncated_samples=False \
     trainer.critic_warmup=0 \
     trainer.logger=$TRAINER_LOGGER \
-    trainer.project_name='deepswe-16h200' \
+    trainer.project_name='deepswe-swebench-16h200' \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
@@ -225,7 +234,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     rllm.env.name=swe_ppio_multistep \
     +rllm.env.env_args.sandbox_pause=False \
     rllm.agent.name=sweagent \
-    rllm.agent.max_steps=50 \
+    rllm.agent.max_steps=30 \
     rllm.agent.overlong_filter=True \
-    rllm.agent.trajectory_timeout=5400 \
-    trainer.total_epochs=200
+    rllm.agent.trajectory_timeout=3600 \
+    trainer.total_epochs=50

@@ -18,7 +18,7 @@ from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_timing_metrics
+from verl.trainer.ppo.metric_utils import compute_data_metrics as _compute_data_metrics_orig, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     ResourcePoolManager,
@@ -32,6 +32,45 @@ from verl.utils.metric import reduce_metrics
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 
 logger = logging.getLogger(__name__)
+
+
+def compute_data_metrics(batch, use_critic=True):
+    """Safe wrapper around verl's compute_data_metrics that handles empty tensors.
+
+    When all response_masks are zero (e.g., due to token mismatch or failed trajectories),
+    torch.max/min on the empty masked tensors would crash. This wrapper catches that and
+    returns fallback metrics instead of crashing the entire training run.
+    """
+    try:
+        return _compute_data_metrics_orig(batch=batch, use_critic=use_critic)
+    except RuntimeError as e:
+        if "Expected reduction dim" in str(e) or "numel() == 0" in str(e):
+            logger.warning(f"compute_data_metrics failed on empty tensor (all samples masked?): {e}. "
+                           "Returning fallback metrics with NaN values.")
+            from verl.trainer.ppo.metric_utils import _compute_response_info
+            response_info = _compute_response_info(batch)
+            prompt_length = response_info["prompt_length"]
+            response_length = response_info["response_length"]
+            max_response_length = batch.batch["responses"].shape[-1]
+            max_prompt_length = batch.batch["attention_mask"][:, :-max_response_length].size(-1)
+            return {
+                "critic/score/mean": float("nan"), "critic/score/max": float("nan"), "critic/score/min": float("nan"),
+                "critic/rewards/mean": float("nan"), "critic/rewards/max": float("nan"), "critic/rewards/min": float("nan"),
+                "critic/advantages/mean": float("nan"), "critic/advantages/max": float("nan"), "critic/advantages/min": float("nan"),
+                "critic/returns/mean": float("nan"), "critic/returns/max": float("nan"), "critic/returns/min": float("nan"),
+                "response_length/mean": torch.mean(response_length).detach().item(),
+                "response_length/max": torch.max(response_length).detach().item(),
+                "response_length/min": torch.min(response_length).detach().item(),
+                "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+                "response_length_non_aborted/mean": float("nan"), "response_length_non_aborted/max": float("nan"),
+                "response_length_non_aborted/min": float("nan"), "response_length_non_aborted/clip_ratio": float("nan"),
+                "response/aborted_ratio": float("nan"),
+                "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+                "prompt_length/max": torch.max(prompt_length).detach().item(),
+                "prompt_length/min": torch.min(prompt_length).detach().item(),
+                "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+            }
+        raise
 
 
 class AgentPPOTrainer(RayPPOTrainer):

@@ -238,6 +238,7 @@ class SandboxPool:
         pool_key = repo if repo else "_default"
         sandbox_idx = trajectory_idx % self._pool_size
 
+        # Check pool for existing sandbox (short lock)
         with self._pool_lock:
             # Initialize repo pool if needed
             if pool_key not in self._repo_pools:
@@ -247,19 +248,31 @@ class SandboxPool:
 
             if sandbox_idx in pool and pool[sandbox_idx] is not None:
                 sandbox = pool[sandbox_idx]
-                # Resume if sandbox was paused, otherwise just reuse
+                # Resume if sandbox was paused, otherwise health-check before reuse
                 try:
                     if self._sandbox_pause:
                         sandbox.connect()
+                    else:
+                        # Health check: verify sandbox is still alive (may have timed out)
+                        sandbox.commands.run("echo alive", timeout=15)
                     print(f"[SandboxPool] Reusing sandbox [{pool_key}][{sandbox_idx}] for trajectory {trajectory_idx}")
                     return sandbox, using_prebuilt
                 except Exception as e:
-                    print(f"[SandboxPool] Failed to resume sandbox [{pool_key}][{sandbox_idx}]: {e}")
+                    print(f"[SandboxPool] Sandbox [{pool_key}][{sandbox_idx}] is stale or dead ({e}), recreating...")
+                    try:
+                        sandbox.kill()
+                    except Exception:
+                        pass
                     pool[sandbox_idx] = None
 
-            # Create new sandbox with retry
-            sandbox = self._create_with_retry(sandbox_idx, template, pool_key, workdir)
-            pool[sandbox_idx] = sandbox
+        # Create new sandbox OUTSIDE the lock to allow concurrent creation
+        sandbox = self._create_with_retry(sandbox_idx, template, pool_key, workdir)
+
+        # Store in pool (short lock)
+        with self._pool_lock:
+            if pool_key not in self._repo_pools:
+                self._repo_pools[pool_key] = {}
+            self._repo_pools[pool_key][sandbox_idx] = sandbox
             return sandbox, using_prebuilt
 
     def _create_with_retry(self, sandbox_idx: int, template: str, pool_key: str, workdir: str):
