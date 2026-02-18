@@ -140,54 +140,90 @@ GPU memory nearly saturated at ~136/143 GB allocated.
 
 During investigation of the NCCL crash, GPU utilization was found at 100% with no training running. A cryptocurrency miner was discovered running on both nodes.
 
-### Malware Inventory
+### Malware Inventory (Deep Scan, Feb 17)
 
-Found on **head node** container (`/var/tmp/` and `/tmp/`):
+**Two distinct cryptocurrency miners** were found across both nodes with persistence mechanisms.
+
+**Head node** container:
 
 | File | Size | Description |
 |------|------|-------------|
 | `/var/tmp/.tmp/python3.7.3` | ~8MB | **ProgPoW Zano GPU miner** (main executable) |
 | `/var/tmp/.gpu-helper` | 13MB | GPU mining helper binary |
-| `/var/tmp/.nethelper-3233` | 23MB | Network communication tool |
+| `/var/tmp/.nethelper-3233` | 23MB | XMRig network helper binary |
 | `/var/tmp/.systemd-worker` | 8MB | Miner disguised as systemd service |
 | `/var/tmp/.lolminer-config.json` | 222B | lolMiner configuration |
-| `/var/tmp/.cache-config` | 24KB | Configuration cache |
+| `/var/tmp/.cache-config` | 24KB | XMRig configuration cache |
 | `/tmp/1.98/mine_*.sh` | Multiple | Mining scripts for ETH, Zano, Grin, Conflux, Radiant, etc. |
+| `/tmp/niggerxd` + `.1` `.2` `.3` | 19.4MB each | ProgPoW Zano miner binary (4 copies) |
+| `/tmp/d.py` | — | **Ray-based distribution script** using `STRICT_SPREAD` placement groups to distribute commands to all cluster nodes |
+| `/etc/systemd/system/network-helper.service` | — | Persistence: auto-restart miner every 10s (`ExecStart=/var/tmp/.nethelper-3233`) |
 
-**Worker node** container had the same `/tmp/1.98/` mining scripts.
+**Worker node** container (additional findings from deep scan):
+
+| File | Size | Description |
+|------|------|-------------|
+| `/tmp/niggerxd` + `.1` `.2` `.3` | 19.4MB each | ProgPoW Zano miner binary (4 copies) |
+| `/var/mail/.nethelper-7177` | 23.9MB | **XMRig CPU miner** (hidden in /var/mail with dot-prefix) |
+| `/var/mail/.systemd-worker` | 8.3MB | Secondary miner binary (ELF 64-bit, statically linked) |
+| `/var/mail/.cache-config` | 24KB | **XMRig config** — pool: `87.121.84.156:3333`, wallet: Monero, 192 CPU threads |
+| `/etc/systemd/system/network-helper.service` | — | Persistence: `ExecStart=/var/mail/.nethelper-7177` |
+
+**Active processes found (all fileless, running from `memfd:`):**
+
+| Node | PIDs | Disguise | Type |
+|------|------|----------|------|
+| Head | 16806, 30930, 46198, 48442 | Process name `x` | ProgPoW GPU miner |
+| Head | 39982 | `[kworker/0:2]` | XMRig CPU miner |
+| Worker | 3064 | `[kworker/0:2]` | XMRig CPU miner |
 
 ### Miner Process Details
 
+**Miner 1: ProgPoW Zano (GPU)**
 ```
 python3.7.3 -a progpowz -o stratum+tcp://45.61.148.247:8443 \
   -u KrQtbtsrPTqSTzQwZZisiyJxgtcDMwrdVrQ -w r
 ```
 
-- **Algorithm:** ProgPoW (Zano cryptocurrency)
-- **Pool:** `stratum+tcp://45.61.148.247:8443`
-- **Wallet:** `KrQtbtsrPTqSTzQwZZisiyJxgtcDMwrdVrQ`
-- **Watchdog:** Parent process (pid watchdog) auto-restarts the miner if killed
+**Miner 2: XMRig (CPU, worker node)**
+- Pool: `87.121.84.156:3333`
+- Wallet: `46aw33qHECDLbNfkJpdzT98xgsPPdxyzRfSds14uaTpW51c2vFgQJmyVygY8ThBnXYZykfKF25nt1VJFPJ1SaGfv5yMK1fd` (Monero)
+- Configured for all 192 CPU threads
+
+### Attack Timeline
+
+1. **Feb 10, ~20:34** — Attacker dropped `niggerxd` binaries via `/tmp/d.py` (Ray distribution script with `STRICT_SPREAD`)
+2. **Feb 10, ~23:00** — Installed `network-helper.service` persistence on head node
+3. **Feb 11, ~00:06** — Installed persistence + XMRig on worker node (`/var/mail/`)
+4. **Feb 11, ~07:29** — XMRig config last modified on worker node
+5. **Feb 15-17** — Fileless `memfd:` miners respawned multiple times (PIDs show Feb 15 and Feb 17 timestamps)
 
 ### Impact on Training
 
-The miner was likely active since **Feb 10-11** (file creation dates), affecting:
+The miner was active since **Feb 10-11**, affecting all three experiment versions:
 
 1. **v1 experiment** (Feb 11): NCCL crash at step 28 — miner competing for GPU memory during FSDP all-reduce
 2. **v2 experiment** (Feb 13-14): 11 steps completed, but GPU contention may have inflated update_actor times
 3. **v3 experiment** (Feb 15-16): NCCL crash at step 5 — miner restarted after container restart, consuming GPU resources during long update_actor phase
 
-The miner running at GPU priority `SN` (nice level) would intermittently cause NCCL timeouts when it competed for GPU memory during the 3.5-hour update_actor FSDP operations.
+### Remediation (Completed Feb 17)
 
-### Remediation
+1. All miner processes killed on both nodes (kill -9)
+2. All malware binaries removed from `/var/tmp/`, `/tmp/`, `/var/mail/`
+3. Systemd persistence services removed on both nodes
+4. Final verification: no memfd-based processes, no suspicious files remain
+5. Only harmless zombie `python3.7.3` processes remain (cleared on container restart)
 
-1. Killed miner processes on both nodes (kill -9)
-2. Removed all malware files from `/var/tmp/` and `/tmp/`
-3. Verified host systems are clean (malware was container-only)
-4. Full security audit of containers pending
+### Infection Vector
 
-### Infection Vector (Suspected)
+Likely entry via **Ray dashboard** (bound to `0.0.0.0:8265` without authentication). The attacker used a Ray-based `d.py` script to distribute miners to all cluster nodes. SSH authorized_keys has 6 keys (all appear legitimate but `anthroid@android` should be verified).
 
-Likely entry via SSH (authorized_keys has 5 public keys) or through the Docker container's exposed ports. The `/tmp/1.98/` directory suggests a known mining toolkit (version 1.98 of lolMiner or similar).
+### Security Recommendations (Deferred)
+
+1. **Restrict Ray dashboard** — bind to localhost or add authentication
+2. **Block mining pool IPs** — `45.61.148.247`, `87.121.84.156` at firewall
+3. **Rotate SSH keys** — attacker had root access
+4. **Monitor GPU utilization** for anomalous activity between training runs
 
 ## Key Observations
 
