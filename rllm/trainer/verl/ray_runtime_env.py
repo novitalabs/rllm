@@ -3,7 +3,7 @@ import os
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
-        "NCCL_DEBUG": "WARN",
+        "NCCL_DEBUG": "INFO",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
@@ -34,6 +34,7 @@ FORWARD_PREFIXES = [
     "CUDNN_",
     "NV_",
     "NVIDIA_",
+    "PPIO_",
 ]
 
 
