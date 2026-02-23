@@ -1,7 +1,7 @@
 # Experiment Log: SWE-Bench Verified v6.2 — 64x H200 (8 nodes x 8 GPUs)
 
 **Date:** 2026-02-22
-**Status:** Stopped after step 9 (migrating to distributed rollout)
+**Status:** Stopped after step 10 (migrating to distributed rollout v6.3)
 
 ## v6.2 Configuration
 
@@ -24,7 +24,7 @@
 
 ---
 
-## v6.2 Step Metrics (Steps 1-9)
+## v6.2 Step Metrics (Steps 1-10)
 
 | Step | Score | Entropy | pg_clipfrac | Steps_mean | Token_mismatch | Rollout(s) | Training(s) | Total(s) |
 |------|-------|---------|-------------|------------|----------------|------------|-------------|----------|
@@ -37,13 +37,21 @@
 | 7 | 0.155 | 6141 | 1.8e-4 | 16.6 | 0.264 | 5164 | 642 | 5860 |
 | 8 | 0.134 | 6153 | 1.8e-4 | 16.7 | 0.295 | 4478 | 647 | 5176 |
 | 9 | 0.152 | 5932 | 1.8e-4 | 16.0 | 0.225 | 5567 | 638 | 6258 |
+| 10 | 0.143 | 5884 | 1.1e-4 | 16.8 | 0.264 | 4536 | 653 | 18143* |
+
+\* Step 10 total includes validation (12871s) + checkpoint save (28s). Rollout+training alone = 5189s.
+
+### Step 10 Validation Results
+- **val/test_score**: 0.131 (13.1% on SWE-Bench Verified)
+- **val/pass@k**: 0.116 (11.6%)
+- solve_all: 2, solve_partial: 19, solve_none: 43 (out of 64 batches)
 
 ---
 
 ## Key Observations
 
 ### Score Improving
-- Step 1: 0.060 -> Steps 7-9: 0.134-0.155 range
+- Step 1: 0.060 -> Steps 7-10: 0.134-0.155 range
 - Significant improvement vs v6 baseline (0.021 avg in v6 steps 1-4)
 - Larger batch (64 vs 8) gives much more consistent gradient signal
 
@@ -53,7 +61,7 @@
 - Still very small — lr=1e-6 is conservative, but at least the policy is moving
 
 ### Entropy Declining
-- 7044 (step 1) -> 5932 (step 9): policy becoming more deterministic
+- 7044 (step 1) -> 5884 (step 10): policy becoming more deterministic
 - Healthy sign of learning — model concentrating probability on better actions
 
 ### Token Mismatch Declining
@@ -68,8 +76,8 @@
 ### Rollout Dominates Step Time
 - Rollout: 4176-5827s (85-89% of step time)
 - Training: 632-666s (11-13% of step time)
-- Average step: ~5500s (~92 min)
-- Total 9 steps: ~13.6 hours
+- Average step: ~5500s (~92 min) excluding validation
+- Total 10 steps: ~15.6 hours (excluding validation/checkpoint at step 10)
 
 ### Idle Nodes During Rollout (Critical Bottleneck)
 - Only 2-3 of 8 nodes are actively used during rollout
@@ -81,7 +89,7 @@
 
 ## Comparison with v6
 
-| Metric | v6 (steps 1-4, bs=8) | v6.2 (steps 1-9, bs=64) |
+| Metric | v6 (steps 1-4, bs=8) | v6.2 (steps 1-10, bs=64) |
 |--------|----------------------|--------------------------|
 | Score range | 0.000-0.109 | 0.060-0.155 |
 | pg_clipfrac | 0.0 (all steps) | 6.8e-5 to 1.8e-4 |
