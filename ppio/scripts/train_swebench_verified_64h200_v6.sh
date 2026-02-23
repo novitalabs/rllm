@@ -168,7 +168,7 @@ SEQUENCE_PARALLEL=8
 # 64 samples × 8 rollouts = 512 trajectories per step
 # 64 / 16 = 4 mini-batches per epoch × 4 epochs = 16 optimizer steps
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 ROLLOUT_N=${ROLLOUT_N:-8}
 
 # Sequence lengths
@@ -277,4 +277,5 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     rllm.agent.max_steps=30 \
     rllm.agent.overlong_filter=True \
     rllm.agent.trajectory_timeout=3600 \
+    +rllm.agent.engine_args.distribute_rollouts=True \
     trainer.total_epochs=200

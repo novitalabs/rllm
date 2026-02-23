@@ -12,6 +12,7 @@ from queue import Queue
 from threading import Thread
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf
 from verl import DataProto
@@ -106,29 +107,87 @@ class AgentPPOTrainer(RayPPOTrainer):
         super().init_workers()
 
         engine_args = OmegaConf.to_container(self.config.rllm.agent.get("engine_args", {})) or {}
+        self.distribute_rollouts = engine_args.pop("distribute_rollouts", False)
         n_parallel_agents = engine_args.pop("n_parallel_agents", None) or self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
         print(f"n_parallel_agents: {n_parallel_agents}")
+        print(f"distribute_rollouts: {self.distribute_rollouts}")
 
-        self.agent_execution_engine = AsyncAgentExecutionEngine(
-            rollout_engine=self.async_rollout_manager,
-            config=self.config,
-            engine_name="verl",
-            tokenizer=self.tokenizer,
-            model_path=self.config.actor_rollout_ref.model.path,
-            max_steps=self.config.rllm.agent.max_steps,
-            max_response_length=self.config.data.max_response_length,
-            max_prompt_length=self.config.data.max_prompt_length,
-            agent_class=self.agent_class,
-            agent_args=self.agent_args,
-            env_class=self.env_class,
-            env_args=self.env_args,
-            enforce_max_prompt_length=self.config.rllm.stepwise_advantage.enable,
-            trajectory_timeout=self.config.rllm.agent.trajectory_timeout,
-            overlong_filter=self.config.rllm.agent.get("overlong_filter", False),
-            disable_thinking=self.config.rllm.disable_thinking,
-            n_parallel_agents=n_parallel_agents,
-            **engine_args,
-        )
+        if self.distribute_rollouts:
+            self.agent_execution_engine = None
+            self._distributed_engine_args = engine_args
+            self._n_parallel_agents = n_parallel_agents
+            self._init_distributed_workers()
+        else:
+            self.distributed_workers = []
+            self.agent_execution_engine = AsyncAgentExecutionEngine(
+                rollout_engine=self.async_rollout_manager,
+                config=self.config,
+                engine_name="verl",
+                tokenizer=self.tokenizer,
+                model_path=self.config.actor_rollout_ref.model.path,
+                max_steps=self.config.rllm.agent.max_steps,
+                max_response_length=self.config.data.max_response_length,
+                max_prompt_length=self.config.data.max_prompt_length,
+                agent_class=self.agent_class,
+                agent_args=self.agent_args,
+                env_class=self.env_class,
+                env_args=self.env_args,
+                enforce_max_prompt_length=self.config.rllm.stepwise_advantage.enable,
+                trajectory_timeout=self.config.rllm.agent.trajectory_timeout,
+                overlong_filter=self.config.rllm.agent.get("overlong_filter", False),
+                disable_thinking=self.config.rllm.disable_thinking,
+                n_parallel_agents=n_parallel_agents,
+                **engine_args,
+            )
+
+    def _init_distributed_workers(self):
+        """Create DistributedTrajectoryWorker actors across all available nodes."""
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+        from rllm.engine.distributed_trajectory_worker import DistributedTrajectoryWorker
+
+        # Get alive node IDs
+        nodes = [n for n in ray.nodes() if n["Alive"]]
+        num_workers = len(nodes)
+        logger.info(f"Initializing {num_workers} distributed trajectory workers across {num_workers} nodes")
+
+        # Divide n_parallel_agents evenly across workers
+        base_parallel = self._n_parallel_agents // num_workers
+        remainder = self._n_parallel_agents % num_workers
+
+        # Get env/agent class as module + name strings (avoids Ray serialization issues)
+        env_module = self.env_class.__module__
+        env_class_name = self.env_class.__name__
+        agent_module = self.agent_class.__module__
+        agent_class_name = self.agent_class.__name__
+
+        server_handles = self.async_rollout_manager.server_handles
+        config = self.config
+
+        self.distributed_workers = []
+        for i, node in enumerate(nodes):
+            node_id = node["NodeID"]
+            n_parallel = base_parallel + (1 if i < remainder else 0)
+
+            scheduling = NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,
+            )
+
+            worker = DistributedTrajectoryWorker.options(
+                scheduling_strategy=scheduling,
+                num_cpus=1,
+            ).remote(
+                config=config,
+                server_handles=server_handles,
+                env_module=env_module,
+                env_class_name=env_class_name,
+                agent_module=agent_module,
+                agent_class_name=agent_class_name,
+                worker_id=i,
+                n_parallel_agents=n_parallel,
+            )
+            self.distributed_workers.append(worker)
+            logger.info(f"Worker {i} scheduled on node {node_id[:8]}... with {n_parallel} parallel agents")
 
     def init_envs_and_agents(self, batch):
         """
@@ -139,6 +198,13 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         full_agent_args = dict(self.config.rllm.agent.get("agent_args", {})) | self.agent_args
         base_env_args = dict(self.config.rllm.env.get("env_args", {})) | self.env_args
+
+        if self.distribute_rollouts:
+            # Store serializable args for distributed workers (don't create envs on head)
+            self._dist_env_args = env_args
+            self._dist_full_agent_args = full_agent_args
+            self._dist_base_env_args = base_env_args
+            return []
 
         def _create_env(i):
             if isinstance(env_args[i], str):
@@ -589,6 +655,10 @@ class AgentPPOTrainer(RayPPOTrainer):
         """
         if timing_raw is None:
             timing_raw = {}
+
+        if self.distribute_rollouts:
+            return self._generate_trajectory_distributed(timing_raw=timing_raw, meta_info=meta_info, mode="Token")
+
         with marked_timer("collect_trajectory", timing_raw):
             trajectories = []
             if self.async_rollout_mode:
@@ -617,6 +687,11 @@ class AgentPPOTrainer(RayPPOTrainer):
             timing_raw = {}
         if uids is None:
             uids = []
+
+        if self.distribute_rollouts:
+            gen_batch, _ = self._generate_trajectory_distributed(timing_raw=timing_raw, meta_info=meta_info, mode="Step", uids=uids)
+            return gen_batch
+
         with marked_timer("collect_trajectory", timing_raw):
             steps = []
             gen_seq_generator = self.generate_agent_trajectories_async(timing_raw=timing_raw, meta_info=meta_info, mode="Step")
@@ -629,6 +704,93 @@ class AgentPPOTrainer(RayPPOTrainer):
             # Transform the raw trajectories into DataProto format.
             final_gen_batch_output = self._transform_agent_steps(steps, uids=uids)
         return final_gen_batch_output
+
+    def _generate_trajectory_distributed(self, timing_raw=None, meta_info=None, mode="Token", uids=None):
+        """Generate trajectories using distributed workers across all nodes.
+
+        Chunks env_args across workers, dispatches via ray.get(), gathers and
+        sorts results, then transforms as usual.
+
+        Args:
+            timing_raw: Dictionary to store timing information for profiling.
+            meta_info: Metadata for veRL generation.
+            mode: "Token" or "Step".
+            uids: Array of unique IDs for Step mode transform.
+
+        Returns:
+            For Token mode: (DataProto, metrics dict)
+            For Step mode: (DataProto, metrics dict) — caller extracts as needed.
+        """
+        if timing_raw is None:
+            timing_raw = {}
+
+        env_args = self._dist_env_args
+        full_agent_args = self._dist_full_agent_args
+        base_env_args = self._dist_base_env_args
+        num_workers = len(self.distributed_workers)
+        total = len(env_args)
+
+        with marked_timer("collect_trajectory", timing_raw):
+            # Wake up rollout replicas from head node
+            asyncio.run(
+                asyncio.gather(*[replica.wake_up() for replica in self.async_rollout_manager.rollout_replicas])
+            )
+
+            # Chunk env_args contiguously across workers
+            base_chunk = total // num_workers
+            remainder = total % num_workers
+
+            futures = []
+            offset = 0
+            for i, worker in enumerate(self.distributed_workers):
+                chunk_size = base_chunk + (1 if i < remainder else 0)
+                chunk = env_args[offset : offset + chunk_size]
+                if chunk:
+                    futures.append(
+                        worker.generate_trajectories.remote(
+                            env_args_list=chunk,
+                            full_agent_args=full_agent_args,
+                            base_env_args=base_env_args,
+                            meta_info=meta_info,
+                            mode=mode,
+                            idx_offset=offset,
+                        )
+                    )
+                offset += chunk_size
+
+            # Gather results from all workers
+            try:
+                worker_results = ray.get(futures)
+            except Exception as e:
+                logger.error(f"Distributed trajectory generation failed: {e}")
+                traceback.print_exc()
+                # Create dummy results for the failed batch
+                worker_results = []
+
+            # Flatten results from all workers
+            trajectories = []
+            for result_list in worker_results:
+                trajectories.extend(result_list)
+
+            # Sleep rollout replicas from head node
+            asyncio.run(
+                asyncio.gather(*[replica.sleep() for replica in self.async_rollout_manager.rollout_replicas])
+            )
+
+        # Sort by global idx
+        trajectories.sort(key=lambda x: x["idx"])
+
+        with marked_timer("transform_trajectory", timing_raw):
+            if mode == "Token":
+                final_gen_batch_output, metrics = self._transform_agent_trajectories(trajectories)
+                return final_gen_batch_output, metrics
+            elif mode == "Step":
+                if uids is None:
+                    uids = np.array([str(i) for i in range(total)], dtype=object)
+                final_gen_batch_output = self._transform_agent_steps(trajectories, uids=uids)
+                return final_gen_batch_output, {}
+            else:
+                raise ValueError(f"Unsupported mode for distributed generation: {mode}")
 
     def _transform_agent_trajectories(self, trajectories: list[dict]):
         """
@@ -1033,3 +1195,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         if hasattr(self, "agent_execution_engine") and self.agent_execution_engine is not None:
             self.agent_execution_engine.shutdown()
             self.agent_execution_engine = None
+        if hasattr(self, "distributed_workers"):
+            for worker in self.distributed_workers:
+                ray.kill(worker)
+            self.distributed_workers = []
