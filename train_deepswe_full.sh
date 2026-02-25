@@ -18,6 +18,7 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export NCCL_NVLS_ENABLE=0
 export NCCL_SOCKET_IFNAME=b_manage0
+export HYDRA_FULL_ERROR=1
 
 source $RLLM_DIR/.venv/bin/activate
 
@@ -40,6 +41,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     data.max_response_length=32768 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=16 \
+    data.shuffle=false \
     actor_rollout_ref.model.path=$MODEL \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -81,7 +83,8 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=2 \
     trainer.save_freq=2 \
-    trainer.test_freq=20 \
+    trainer.max_actor_ckpt_to_keep=3 \
+    trainer.test_freq=200 \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=/home/claude/work/rllm-origin/checkpoints/\${trainer.project_name}/\${trainer.experiment_name} \
     rllm.env.name=swe \
@@ -90,7 +93,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     rllm.agent.name=r2egym \
     rllm.agent.max_steps=50 \
     rllm.agent.overlong_filter=True \
-    rllm.agent.trajectory_timeout=1800 \
+    rllm.agent.trajectory_timeout=3600 \
     trainer.total_epochs=1 \
     trainer.total_training_steps=200 \
     2>&1 | tee ~/work/logs/deepswe_full.log

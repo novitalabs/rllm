@@ -501,7 +501,8 @@ class AgentExecutionEngine:
         for _ in range(self.retry_limit):
             try:
                 application_id = str(uuid.uuid4())
-                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
+                outer_timeout = int((self.trajectory_timeout or 3600) * 1.2)
+                return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=outer_timeout)
             except Exception:
                 traceback.print_exc()
                 continue
