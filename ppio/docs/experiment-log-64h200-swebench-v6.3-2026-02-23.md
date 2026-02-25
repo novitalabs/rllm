@@ -1,7 +1,7 @@
 # Experiment Log: SWE-Bench Verified v6.3 — 64x H200 (8 nodes x 8 GPUs)
 
 **Date:** 2026-02-23
-**Status:** Running (step 2 completed)
+**Status:** Stopped after step 2 (migrated to v6.4 to test full-batch updates)
 **Previous:** v6.2 (stopped after step 10, score 0.060→0.155)
 
 ## v6.3 Configuration
