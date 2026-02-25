@@ -1,7 +1,7 @@
 # Experiment Log: SWE-Bench Verified v6.4 — 64x H200 (8 nodes x 8 GPUs)
 
 **Date:** 2026-02-23 ~ 2026-02-24
-**Status:** Running (step 25 completed, step 26 in progress)
+**Status:** Running (step 26 completed)
 **Previous:** v6.3 (stopped after step 2, migrated to v6.4)
 
 ## v6.4 Configuration
@@ -25,7 +25,7 @@
 
 ---
 
-## v6.4 Step Metrics (Steps 1-25)
+## v6.4 Step Metrics (Steps 1-26)
 
 | Step | Score | Entropy | pg_clipfrac | Steps_mean | Token_mismatch | solve_none/all/partial | Grad_norm | Rollout(s) | Training(s) | Total(s) |
 |------|-------|---------|-------------|------------|----------------|------------------------|-----------|------------|-------------|----------|
@@ -54,6 +54,7 @@
 | 23 | 0.133 | 6748 | 0.0 | 17.8 | 0.275 | 42/0/22 | 211 | 3971 | 652 | 4677 |
 | 24 | 0.170 | 6319 | 0.0 | 18.8 | 0.289 | 40/1/23 | 253 | 3785 | 627 | 4465 |
 | 25 | 0.096 | 7037 | 0.0 | 18.2 | 0.262 | 48/1/15 | 172 | 4096 | 634 | 4814 |
+| 26 | **0.192** | 6573 | 0.0 | 17.8 | 0.270 | 34/3/27 | 213 | 4716 | 631 | 5402 |
 
 \* Step 10 total includes validation (5995s) + checkpoint (25s). Step 20 total includes validation (6584s) + checkpoint.
 
@@ -344,3 +345,211 @@ llm_time_max ranges 3643-5745s. Step time dominated by the slowest trajectory.
 
 ### Token Mismatch
 8. **Investigate retokenization mismatch** at the vLLM level. 30% of trajectories lose gradient signal due to response_masks being zeroed. This is the single largest source of wasted compute per trajectory.
+
+---
+
+## Detailed Analysis (26 Steps)
+
+### 1. Reward Distribution
+
+Over 26 steps × 512 trajectories = 13,312 total trajectories (10,717 logged with completion reasons, excluding Ray log deduplication):
+
+| Reward | Count | % | Description |
+|--------|-------|---|-------------|
+| 0.0 (fail) | 9,215 | **86.3%** | No tests passed |
+| 1.0 (full solve) | 1,277 | **12.0%** | All tests passed |
+| 0 < r < 1 (partial) | 191 | **1.8%** | Some tests passed |
+
+**Key observations:**
+- Reward is overwhelmingly binary: 98.3% of trajectories get exactly 0.0 or 1.0
+- Only 1.8% achieve partial credit — the reward landscape is essentially pass/fail
+- With RLOO advantage estimation, the advantage for each trajectory is computed relative to the mean reward of its 8 rollouts for the same problem
+- Since most problems are either always-fail (64.7%) or mixed (34.3%), the advantage signal is sparse
+
+**Partial reward breakdown:**
+- 0.3333 (88 trajectories), 0.5 (88), 0.6667 (24), 0.8077 (22), 0.7055 (14) — a few distinctive partial scores from multi-test problems
+
+### 2. Termination Reasons
+
+| Reason | Count | % | Description |
+|--------|-------|---|-------------|
+| ENV_DONE | 9,299 | **86.8%** | Agent submitted solution and env terminated normally |
+| TRUNCATION | 621 | **5.8%** | Response exceeded max_response=32768 tokens |
+| MAX_STEPS | 412 | **3.8%** | Agent reached max_steps=30 without submitting |
+| ENV_TIMEOUT | 351 | **3.3%** | Trajectory exceeded trajectory_timeout=3600s |
+| PROMPT_OVERLONG | 34 | **0.3%** | Prompt exceeded max_prompt_length=8192 tokens |
+
+**Analysis:**
+- 86.8% terminate normally (ENV_DONE) — the agent learns to submit solutions
+- TRUNCATION (5.8%): These trajectories hit the 32K token response limit. The response_length/clip_ratio (1.08% mean) measures a different thing — it counts samples at exactly max length, which is lower because truncated trajectories often get shorter assembled responses
+- MAX_STEPS (3.8%): Agent uses all 30 steps without submitting. These trajectories consume maximum LLM time (~78s × 30 = 2340s) and contribute disproportionately to long-tail
+- ENV_TIMEOUT (3.3%): Trajectories hitting the 3600s wall-clock limit. These are the primary long-tail offenders
+- PROMPT_OVERLONG (0.3%): 34 trajectories filtered due to prompts exceeding 8192 tokens. These generate zero gradient signal (immediate discard)
+
+**Recommendation:** MAX_STEPS + ENV_TIMEOUT account for 7.1% of trajectories but dominate wall-clock time. Reducing max_steps from 30 to 25 and trajectory_timeout from 3600s to 2400s would reduce long-tail with minimal reward impact (these trajectories almost always score 0.0).
+
+### 3. Per-Problem Solve Consistency
+
+Each step samples 64 unique problems with 8 rollouts each. Over 26 steps, 1,664 problem-batches:
+
+| Category | Count | % | Description |
+|----------|-------|---|-------------|
+| solve_none | 1,077 | **64.7%** | All 8 rollouts failed (reward=0.0 for all) |
+| solve_partial | 571 | **34.3%** | Some rollouts succeeded, some failed |
+| solve_all | 16 | **1.0%** | All 8 rollouts succeeded (reward=1.0 for all) |
+
+**Analysis:**
+- **64.7% of problems are never solved** in any of 8 attempts → zero advantage signal for these samples (all rewards identical → RLOO advantage = 0)
+- **1.0% always solved** → also zero advantage signal (all rewards identical)
+- **34.3% partially solved** → these are the ONLY samples that provide non-zero advantage signal
+- Effective training signal comes from only ~34% of the batch in each step
+- This means ~66% of compute (rollout time) generates no gradient signal at all, even before token mismatch filtering
+
+**Implication for RLOO:** The RLOO advantage estimator requires variance within rollout groups. With 65.7% of problems producing uniform outcomes (all-fail or all-success), the advantage distribution is extremely sparse. This partially explains the weak learning signal — even with more optimizer steps (v6.2/v6.3), the fundamental constraint is that only ~34% of samples carry any gradient information.
+
+### 4. Token Mismatch Root Cause Analysis
+
+**Scale:** 3,667 retokenization mismatch warnings logged across 26 steps. With 512 trajectories/step × 26 steps = 13,312 total, the mismatch rate is ~27.5% (consistent with the per-step mean of 29.5%).
+
+**Pattern from log analysis:**
+
+Typical mismatch example:
+```
+Position 6335: Expected [52604, 11525, 13, 13824, 11], Got [422, 37527, 316, 347, 2425]
+Position 7508: Expected [272, 20008, 7197, 13, 3197], Got [13665, 2539, 7197, 13, 3197]
+Position 8214: Expected [1890, 4835, 49253, 2578, 13216], Got [76168, 49253, 2578, 13216, 15279]
+```
+
+**Root cause mechanism:**
+1. During rollout, vLLM generates multi-step responses. Each step's response tokens are stored individually
+2. During `assemble_steps()`, all step responses are concatenated into one long sequence
+3. This concatenated sequence is re-tokenized from text to verify token alignment
+4. The re-tokenization produces different token IDs at step boundaries because tokenizers use **context-dependent BPE merges** — the same text produces different tokens depending on surrounding context
+5. When mismatch is detected, `response_masks` is set to all-zeros → the trajectory contributes zero gradient signal
+
+**The mismatch occurs at step boundaries (positions 6335, 7508, 8214 — mid-response)** where the concatenation of two separately-tokenized segments produces different BPE merges than tokenizing the full concatenation at once. This is a fundamental property of BPE tokenization with Qwen3's vocabulary.
+
+**Impact:** 29.5% of trajectories × 86% rollout cost = ~25% of total GPU-hours produce zero gradient. Combined with the 65.7% solve_none rate (which produces zero advantage), the effective useful compute fraction is approximately:
+- 34.3% × 70.5% = **24.2%** of trajectories provide actual gradient signal
+
+### 5. Response Length Analysis
+
+| Metric | Value |
+|--------|-------|
+| Mean response length | 15,911 tokens |
+| Min step-mean | 14,436 tokens (step 7) |
+| Max step-mean | 16,992 tokens (step 25) |
+| Max possible | 32,768 tokens |
+| Mean clip ratio | 1.08% (hit max length) |
+| Clip ratio range | 0.39% — 2.34% |
+| Aborted ratio | 0.0% (all steps) |
+
+**Response length per step (no trend):**
+```
+Steps  1-5:  15608, 15588, 16543, 15585, 16890
+Steps  6-10: 16360, 14436, 15640, 15939, 15952
+Steps 11-15: 15597, 15325, 15588, 16102, 16670
+Steps 16-20: 15763, 15919, 16285, 15435, 16316
+Steps 21-26: 15022, 16217, 15821, 16148, 16992, 15950
+```
+
+No upward or downward trend in response length — the policy is not becoming more or less verbose over training. This is consistent with the flat entropy trajectory.
+
+**Correlation with score:** High-score steps don't systematically have different response lengths. Step 11 (score=0.194, highest) has mean length 15,597 — almost exactly the overall mean. Step 15 (score=0.077, lowest) has 16,670 — slightly above average. No meaningful length-score correlation.
+
+### 6. CPU Memory Growth
+
+| Step | CPU Memory (GB) | Delta |
+|------|----------------|-------|
+| 1 | 72.3 | — |
+| 5 | 73.9 | +1.6 |
+| 10 | 80.2 | +6.3 |
+| 15 | 80.9 | +0.7 |
+| 20 | 82.2 | +1.3 |
+| 25 | 82.8 | +0.6 |
+| 26 | 82.9 | +0.1 |
+
+**Growth pattern:**
+- Total growth: 72.3 → 82.9 GB = **+10.7 GB over 26 steps**
+- Average rate: **0.43 GB/step**
+- Growth is NOT linear — fastest between steps 5-10 (+6.3 GB), slowing after step 15
+- The step 5→10 jump coincides with the first validation (step 10), which creates 500 additional environments
+
+**Projection:** If growth continues at the current rate (0.1-0.6 GB/step in later steps):
+- Step 50: ~93 GB
+- Step 100: ~115 GB
+- Step 200: ~157 GB
+
+The node has ~188 GB total RAM. At current growth rates, OOM risk is low for a 30-step run but concerning for longer training. The growth may be from:
+1. Ray object store accumulation (trajectory results not fully GC'd)
+2. Python garbage collector not reclaiming large trajectory buffers promptly
+3. Sandbox connection pool metadata growth
+
+**GPU memory:** Stable at 158.3 GB allocated / 176.2 GB reserved per GPU across all 26 steps. No GPU memory growth.
+
+### 7. Cross-Step Problem Overlap & Advantage Distribution
+
+**Problem sampling statistics** (500 problems, 64 per step, 26 steps):
+
+| Metric | Value |
+|--------|-------|
+| Total problem-samples | 1,664 |
+| Expected samples per problem | 3.3 |
+| Problems never seen | ~14 (2.8%) |
+| Problems seen at least once | ~486 (97.2%) |
+
+**Simulated sampling distribution:**
+```
+0 times:  11 problems (2.2%)
+1 time:   52 problems (10.4%)
+2 times:  99 problems (19.8%)
+3 times:  118 problems (23.6%)  ← mode
+4 times:  104 problems (20.8%)
+5 times:  71 problems (14.2%)
+6 times:  35 problems (7.0%)
+7+ times: 10 problems (2.0%)
+```
+
+Most problems are sampled 2-4 times over 26 steps. The dataset is well-utilized — 97% of problems are seen at least once.
+
+**Advantage distribution:**
+
+| Metric | Value |
+|--------|-------|
+| Advantage mean (across steps) | -0.0085 |
+| Advantage mean range | -0.0353 to +0.0198 |
+| Advantage max | 1.0 |
+| Advantage min | -1.0 (most steps), -0.857 (some steps) |
+
+The advantage mean is near zero (as expected for RLOO), but the per-step mean fluctuates around zero with no trend. The advantage range is always [-1, 1] or [-0.857, 1]:
+- Max advantage = 1.0: a trajectory that solved when all 7 siblings failed (reward 1.0, mean 1/8 ≈ 0.125, advantage ≈ 0.875, clipped to 1.0)
+- Min advantage = -1.0: a trajectory that failed when all siblings also failed but one solved, yielding negative advantage
+- Min = -0.857 = -6/7: exactly 1 of 8 rollouts solved (advantage for failing trajectories = 0 - 1/8 × 7/6 ≈ -0.857 under RLOO normalization)
+
+**The advantage signal is extremely sparse.** With 64.7% solve_none (all 8 fail → advantage = 0 for all) and 1.0% solve_all (all 8 succeed → advantage = 0 for all), only the ~34% solve_partial problems generate non-zero advantages. Within those, the advantage is binary: +1 for success, ~-0.14 to -1.0 for failure. This is a very noisy, high-variance signal.
+
+### pg_loss Behavior
+
+| Metric | Value |
+|--------|-------|
+| pg_loss mean | 1.17 |
+| pg_loss range | -2.46 to 4.75 |
+| pg_loss trend | No trend (oscillating) |
+
+The pg_loss fluctuates widely between steps (-2.46 to +4.75) with no trend. This is consistent with the sparse, high-variance advantage signal — each step's loss depends heavily on which specific problems were sampled and whether any rollout groups had mixed outcomes.
+
+---
+
+## Summary: Why v6.4 Doesn't Learn
+
+The convergence failure is multi-factorial:
+
+1. **Too few optimizer steps (4):** Full-batch PPO with lr=1e-6 moves the policy so little that pg_clipfrac = 0.0 for all 26 steps. The trust region constraint is never active.
+
+2. **Sparse reward signal:** Only 34.3% of problem-batches have mixed solve outcomes (the only source of non-zero RLOO advantage). 65.7% of batches produce zero gradient.
+
+3. **Token mismatch:** An additional 29.5% of trajectories lose gradient signal due to retokenization mismatches, bringing effective useful trajectories down to ~24%.
+
+4. **High-variance advantage:** Among the ~24% of useful trajectories, the advantage is binary (+1 or ~-0.14 to -1.0), creating noisy gradient estimates that require many optimizer steps to average out — which v6.4's 4 steps cannot provide.
+
+5. **Result:** The policy oscillates randomly within a narrow score band (0.077-0.194) with no upward trend, while consuming 2,158 GPU-hours of compute.
