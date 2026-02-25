@@ -158,6 +158,158 @@ Full-batch PPO updates (mini_batch=batch_size) with lr=1e-6 produce policy chang
 
 ---
 
+## Training Pipeline Timing & Resource Analysis
+
+### Step-Level Timing Breakdown (mean over 25 steps)
+
+Each step averages **4855s (~81 min)**, excluding validation/checkpoint:
+
+| Phase | Time (s) | % of Step | Description |
+|-------|----------|-----------|-------------|
+| **collect_trajectory (rollout)** | **4162** | **85.7%** | vLLM wake_up → distributed agent loop → vLLM sleep |
+| update_actor (training) | 637 | 13.1% | 4 epochs × 1 full-batch PPO update via FSDP |
+| old_log_prob | 55 | 1.1% | Recompute reference log probs from current policy |
+| transform_trajectory | 1 | 0.0% | Convert raw trajectories to DataProto tensors |
+| advantage computation | 0.1 | 0.0% | RLOO advantage estimation |
+
+### Rollout Internal Breakdown (collect_trajectory = 4162s)
+
+```
+collect_trajectory (4162s)
+│
+├─ 1. vLLM wake_up (weight sync)                      ~30-60s est.
+│     FSDP actor weights → 8 vLLM TP replicas
+│     trainer.py:735-738, verl_engine.py:108-110
+│
+├─ 2. Dispatch to 8 DistributedTrajectoryWorker        ~1-2s
+│     ray.remote(): chunk 512 trajectories → 8 workers × 64
+│     trainer.py:744-760
+│
+├─ 3. Parallel trajectory execution (BOTTLENECK)       ~3700-5700s
+│     512 trajectories across 8 nodes, bounded by slowest
+│     │
+│     ├─ 3a. env.reset()                              ~10-30s/traj
+│     │     PPIO API: create_sandbox → clone_repo → install_deps
+│     │     swe_ppio_multistep.py:378-442
+│     │
+│     ├─ 3b. Agent loop × 17.5 steps (mean)           ~1370s mean
+│     │     Per agent step:
+│     │     ├─ LLM inference: ~78s/step (97.9%)
+│     │     │   verl_engine.py:80, 512 concurrent requests
+│     │     │   across 8 vLLM replicas (load balanced)
+│     │     ├─ Response parse + action extract: <0.1s
+│     │     └─ env.step(action): ~1.7s/step (2.1%)
+│     │         Sandbox HTTP: bash/edit/submit
+│     │
+│     └─ 3c. compute_final_reward()                   <0.3s
+│           Cached from submit, negligible
+│
+├─ 4. ray.get() wait for all workers                   (included in 3)
+│     trainer.py:764
+│
+└─ 5. vLLM sleep (release GPU for training)            ~10-30s est.
+      trainer.py:777-780, verl_engine.py:112-114
+```
+
+### Per-Trajectory Timing
+
+| Metric | Mean | Max | Ratio |
+|--------|------|-----|-------|
+| LLM inference | 1370s (23 min) | 3960s (66 min) | 2.89x |
+| Env interaction | 29s | 531s | 18.3x |
+| Total trajectory | 1399s (23 min) | 3973s (66 min) | 2.84x |
+
+LLM accounts for **97.9%** of trajectory time. The per-step LLM time (~78s) is high because 512 concurrent trajectories share 8 vLLM replicas, creating inference queueing.
+
+### Long-Tail Analysis
+
+```
+Trajectory time distribution:
+  Mean:  1399s (23 min)
+  Max:   3973s (66 min)  ← step completion bounded by this
+
+  Idle wait = max - mean = 2574s (43 min)
+  Idle wait = 62% of rollout time
+
+  Estimated wasted GPU-hours (25 steps):
+    2574s × 64 GPUs × 25 steps / 3600 = ~1144 GPU-hours
+```
+
+### Training Phase Breakdown (update_actor = 637s)
+
+| Sub-phase | Time (s) | Description |
+|-----------|----------|-------------|
+| old_log_prob | 55 | Forward pass to recompute log probs |
+| advantage (RLOO) | 0.1 | Advantage estimation (trivial for RLOO) |
+| update_actor | 637 | 4 epochs × 1 mini-batch PPO update |
+| **Total training** | **692** | All non-rollout GPU computation |
+
+- MFU: **7.63%** (low, due to SP=8 communication overhead on long sequences)
+- GPU memory allocated: 158.3 GB per GPU (reserved: 176.2 GB)
+- CPU memory: 72.3 → 82.8 GB (slow growth, possible leak)
+- Per-token timing: 0.070 ms/token (update_actor), 0.006 ms/token (advantage)
+
+### Validation Phase Breakdown
+
+Validation triggers at step 10 and 20 (test_freq=10):
+
+| Component | Step 10 | Step 20 | Description |
+|-----------|---------|---------|-------------|
+| Total validation | **5995s** (100 min) | **6507s** (108 min) | `timing_s/testing` |
+| Checkpoint save | 25s | 21s | `timing_s/save_checkpoint` |
+
+Validation internal flow:
+```
+_validate_agent() (5995-6507s)
+│
+├─ 1. Load val data                                    <1s
+│     500 samples, val_batch_size=512 → 1 batch
+│     val_kwargs: n=1, temperature=0 (greedy)
+│
+├─ 2. init_envs_and_agents()                           ~5-10s
+│     ThreadPoolExecutor(64): create 500 envs + agents
+│
+├─ 3. generate_agent_trajectory() ← DOMINATES          ~5900-6400s
+│     Same distributed rollout pipeline:
+│     wake_up → 8 workers × ~63 traj → ray.get → sleep
+│
+└─ 4. Aggregate rewards + compute metrics              <1s
+      test_score, pass@k per data_source
+```
+
+**Why validation takes ~50% longer than training rollout:**
+
+| Factor | Training Rollout | Validation |
+|--------|-----------------|------------|
+| Total trajectories | 512 | 500 |
+| Unique problems | **64** (× 8 rollouts each) | **500** (× 1 each) |
+| Temperature | 1.0 (random sampling) | 0 (greedy) |
+| Problem diversity | Low (8 repeats per problem) | **High (all unique)** |
+| Long-tail severity | Moderate | **Severe** |
+| Average time | ~4100s | ~6250s |
+
+The root cause is **problem diversity**: training samples 64 unique problems (each with 8 rollouts), so the 8 copies of the same problem have similar runtimes. Validation runs 500 unique problems, dramatically increasing the probability of extreme outliers that dominate wall-clock time.
+
+### GPU Resource Consumption (25 steps)
+
+| Phase | Per-step GPU-hrs | 25-step GPU-hrs | % |
+|-------|-----------------|-----------------|---|
+| Rollout (inference) | 74.0 | 1850 | **86%** |
+| Training (FSDP) | 12.3 | 307 | 14% |
+| **Total (excl val)** | **86.3** | **2158** | 100% |
+| Validation (2 runs) | — | ~222 | extra |
+
+### Waste & Inefficiency Summary
+
+| Source | Impact | 25-step GPU-hours wasted |
+|--------|--------|-------------------------|
+| **Long-tail idle wait** | 62% of rollout time, GPUs idle | ~1144 |
+| **Token mismatch (~30%)** | 30% trajectories lose gradient signal | ~555 (proportional) |
+| **Low MFU (7.63%)** | Training phase underutilizes compute | ~230 (vs 30% target) |
+| **Validation overhead** | ~100 min per validation, all 500 samples | ~222 (2 validations) |
+
+---
+
 ## Issues
 
 ### 1. Zero Policy Clipping (Root Cause: Too Few Optimizer Steps)
@@ -173,10 +325,22 @@ llm_time_max ranges 3643-5745s. Step time dominated by the slowest trajectory.
 
 ## Recommendations
 
+### PPO Hyperparameters
 1. **Return to small mini_batch_size.** mini_batch=8 (v6.3) or mini_batch=16 (v6.2) both show actual policy updates. v6.3's 32 optimizer steps showed the most promising per-step improvement.
 
 2. **Consider increasing learning rate** instead of reducing mini_batch size. With mini_batch=64 and lr=5e-6 or 1e-5, the policy might move enough to trigger clipping while retaining the benefit of low-variance full-batch gradients.
 
-3. **Reduce trajectory timeout** to 2400s to mitigate long-tail rollout time.
+### Rollout Efficiency
+3. **Reduce trajectory_timeout** from 3600s to 2400s. Long-tail trajectories (max ~4000s) cause 62% of rollout time to be idle waiting. Capping at 2400s would lose ~5% of trajectories but save ~30% rollout time.
 
-4. **Investigate partial rollout** — start training when 80-90% of trajectories are complete instead of waiting for all 512.
+4. **Implement partial rollout** — start training when 80-90% of trajectories are complete instead of waiting for all 512. The streaming generator (`asyncio.as_completed`) already exists; only the batch collection logic needs modification.
+
+### Validation Efficiency
+5. **Reduce validation samples.** Currently validates all 500 problems (6000-6500s per validation). Sampling 100-200 problems would give stable estimates while cutting validation time by 60-70%.
+
+6. **Increase test_freq** from 10 to 20. Two validations in 25 steps cost ~12500s total (222 GPU-hours). Less frequent validation saves significant wall time.
+
+7. **Apply shorter timeout for validation.** Validation trajectories don't need gradient signal — a 2400s timeout would reduce long-tail impact with minimal accuracy loss.
+
+### Token Mismatch
+8. **Investigate retokenization mismatch** at the vLLM level. 30% of trajectories lose gradient signal due to response_masks being zeroed. This is the single largest source of wasted compute per trajectory.
