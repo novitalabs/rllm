@@ -732,9 +732,10 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         with marked_timer("collect_trajectory", timing_raw):
             # Wake up rollout replicas from head node
-            asyncio.run(
-                asyncio.gather(*[replica.wake_up() for replica in self.async_rollout_manager.rollout_replicas])
-            )
+            async def _wake_up_replicas():
+                await asyncio.gather(*[replica.wake_up() for replica in self.async_rollout_manager.rollout_replicas])
+
+            asyncio.run(_wake_up_replicas())
 
             # Chunk env_args contiguously across workers
             base_chunk = total // num_workers
@@ -773,9 +774,10 @@ class AgentPPOTrainer(RayPPOTrainer):
                 trajectories.extend(result_list)
 
             # Sleep rollout replicas from head node
-            asyncio.run(
-                asyncio.gather(*[replica.sleep() for replica in self.async_rollout_manager.rollout_replicas])
-            )
+            async def _sleep_replicas():
+                await asyncio.gather(*[replica.sleep() for replica in self.async_rollout_manager.rollout_replicas])
+
+            asyncio.run(_sleep_replicas())
 
         # Sort by global idx
         trajectories.sort(key=lambda x: x["idx"])

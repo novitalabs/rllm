@@ -24,16 +24,27 @@ set -x
 # v6.2 changes:
 #   - train_batch_size: 8 -> 64 (8x increase for better gradient estimates
 #     and more policy updates per step; pg_clipfrac=0 in v6.1 steps 1-3)
-#   - ppo_mini_batch_size: 8 -> 16 (64/8=8 mini-batches/epoch × 4 = 32 opt steps)
+#   - ppo_mini_batch_size: 8 -> 16 (64/16=4 mini-batches/epoch × 4 = 16 opt steps)
 #   - ppo_max_token_len_per_gpu: 32000 -> 64000 (accommodate 2 samples per
 #     mini-batch per GPU: 16/8=2)
 #   - SANDBOX_POOL_SIZE: 512 (matches 64×8=512 trajectories)
 #
+# v6.3 changes (from v6.2):
+#   - ppo_mini_batch_size: 16 -> 8 (64/8=8 mini-batches/epoch × 4 = 32 opt steps)
+#   - distribute_rollouts=True: distribute trajectory execution across all 8
+#     nodes using DistributedTrajectoryWorker Ray actors (one per node)
+#   - Result: rollout only 4-7% faster (bottleneck is LLM inference, already distributed)
+#
+# v6.4 changes (from v6.3):
+#   - ppo_mini_batch_size: 8 -> 64 (= train_batch_size, 1 mini-batch/epoch × 4 = 4 opt steps)
+#   - ppo_max_token_len_per_gpu: 64000 -> 512000 (8 samples/GPU per mini-batch: 64/8=8)
+#   - Goal: test whether fewer but full-batch optimizer steps improve learning
+#
 # With 8 nodes (DP=8) and bs=64:
 #   - 64 samples × 8 rollouts = 512 trajectories per step
-#   - ppo_mini_batch_size=16 → 64/16 = 4 mini-batches per epoch
-#   - 4 epochs × 4 mini-batches = 16 optimizer steps per step
-#   - Each DP rank processes 16/8 = 2 samples per mini-batch
+#   - ppo_mini_batch_size=64 → 64/64 = 1 mini-batch per epoch
+#   - 4 epochs × 1 mini-batch = 4 optimizer steps per step
+#   - Each DP rank processes 64/8 = 8 samples per mini-batch
 #
 # Training from base model (no resume).
 # =============================================================================
@@ -168,7 +179,7 @@ SEQUENCE_PARALLEL=8
 # 64 samples × 8 rollouts = 512 trajectories per step
 # 64 / 16 = 4 mini-batches per epoch × 4 epochs = 16 optimizer steps
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 ROLLOUT_N=${ROLLOUT_N:-8}
 
 # Sequence lengths
@@ -179,13 +190,13 @@ MAX_RESPONSE_LENGTH=32768
 # With DP=8, parameters sharded 8 ways → much less memory per GPU.
 # No offloading needed. ppo_max_token_len_per_gpu=64000 (2 samples/GPU per mini-batch).
 GPU_MEMORY_UTILIZATION=0.7
-PPO_MAX_TOKEN_LEN_PER_GPU=64000
+PPO_MAX_TOKEN_LEN_PER_GPU=256000
 
 # Sandbox pool size — must be >= batch_size * rollout_n for full concurrency
 SANDBOX_POOL_SIZE=512
 
 # Checkpoint and logging
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-32b-swebench-64h200-v6.2}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-32b-swebench-64h200-v6.4}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-/data/checkpoints/deepswe-swebench-64h200/${EXPERIMENT_NAME}}"
 SAVE_FREQ=${SAVE_FREQ:-5}
 TEST_FREQ=${TEST_FREQ:-10}
