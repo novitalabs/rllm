@@ -403,15 +403,21 @@ class VLLMCompleter:
         self.temperature = temperature
         self.enable_thinking = enable_thinking
 
-    def complete(self, messages: List[Dict[str, str]]) -> tuple:
+    def complete(self, messages: List[Dict[str, str]], max_context: int = 65536) -> tuple:
         """Returns (full_text_for_history, content_for_parsing).
         When thinking is enabled, full_text includes <think>...</think> tags for conversation history,
-        while content_for_parsing contains only the action text."""
+        while content_for_parsing contains only the action text.
+        Dynamically caps max_tokens so input + output <= max_context."""
+        # Estimate input tokens (~4 chars per token) and cap max_tokens to fit context
+        input_chars = sum(len(m.get("content", "")) for m in messages)
+        est_input_tokens = input_chars // 3  # conservative estimate
+        effective_max_tokens = min(self.max_tokens, max(1024, max_context - est_input_tokens))
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_tokens=effective_max_tokens,
             extra_body={"chat_template_kwargs": {"enable_thinking": self.enable_thinking}},
         )
         msg = response.choices[0].message
