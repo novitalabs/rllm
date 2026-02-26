@@ -448,28 +448,101 @@ export NCCL_NET=IB
 
 ---
 
-## 10. Training Metrics (Run 8, Steps 187-198)
+## 10. Step-Level Training Metrics
 
-Run 8 (from step 186 restart) was the cleanest — zero TimeoutErrors throughout.
+Extracted from console logs (`~/work/logs/deepswe_full*.log`). Steps 5-160 are missing — log files overwritten by subsequent restarts. Steps 165-170 impacted by crypto miner (zero learning). pg_clipfrac=0.0 for ALL steps, confirming dead learning.
 
-| Step | Score | Solve (all/partial/none) | Step Time (s) | PPO Update (s) |
-|------|-------|--------------------------|---------------|----------------|
-| 187 | 40.6% | 0/3/1 | 2519 | 117 |
-| 188 | 21.9% | 0/2/2 | 3450 | 122 |
-| 189 | 18.8% | 0/3/1 | 2002 | 124 |
-| 190 | 50.0% | 2/0/2 | 2030 | 111 |
-| 191 | 25.0% | 0/3/1 | 2302 | 112 |
-| 192 | 28.1% | 0/3/1 | 2497 | 128 |
-| 193 | 37.5% | 0/3/1 | 2315 | 118 |
-| 194 | 21.9% | 0/1/3 | 2061 | 124 |
-| 195 | 12.5% | 0/2/2 | 3020 | 138 |
-| 196 | 21.9% | 0/2/2 | 2101 | 130 |
-| 197 | 59.4% | 0/3/1 | 2228 | 118 |
-| 198 | 21.9% | 0/2/2 | 2019 | 120 |
+**Phase 1: Initial Training (Feb 12, Run 1)**
 
-**Averages**: Score ~30%, Step Time ~2379s (~40 min), PPO Update ~122s
+| Step | Score | pg_loss | pg_clip | entropy | grad_norm | resp_len | traj_steps | llm_time | step_time | PPO_time | solve(a/p/n) |
+|------|-------|---------|---------|---------|-----------|----------|------------|----------|-----------|----------|--------------|
+| 1 | 0.0% | 0.00 | 0.0 | 1633 | 0 | 29187 | 30.5 | 570s | 1825s | 96s | 0/0/4 |
+| 2 | 6.2% | 43.90 | 0.0 | 1354 | 1771 | 27627 | 31.4 | 660s | 1689s | 82s | 0/1/3 |
+| 3 | 9.4% | 123.57 | 0.0 | 1308 | 2603 | 28923 | 28.6 | 671s | 1440s | 88s | 0/2/2 |
+| 4 | 31.2% | 183.65 | 0.0 | 1600 | 3719 | 26906 | 33.0 | 540s | 1133s | 82s | 0/3/1 |
 
----
+*Steps 5-160: No console logs preserved (overwritten by nohup restarts).*
+*Partial diary records: Step 31=40.6%, Step 56=68.8% (peak), Step 109=46.9%, Step 119=40.6%, Step 121=28.1%, Step 127=37.5%.*
+
+**Phase 2: Crypto Miner Period (Feb 21, Steps 161-170, ZERO LEARNING)**
+
+| Step | Score | pg_loss | pg_clip | entropy | grad_norm | resp_len | traj_steps | llm_time | step_time | PPO_time | solve(a/p/n) |
+|------|-------|---------|---------|---------|-----------|----------|------------|----------|-----------|----------|--------------|
+| 161 | 6.2% | 3.76 | 0.0 | 918 | 1606 | 8861 | 6.0 | 4611s | 6876s | 264s | 0/1/3 |
+| 165 | 0.0% | 0.00 | 0.0 | 557 | 0 | 6379 | 4.8 | 3008s | 11811s | 244s | 0/0/4 |
+| 166 | 0.0% | 0.00 | 0.0 | 362 | 0 | 7504 | 4.1 | 2410s | 4407s | 249s | 0/0/4 |
+| 167 | 0.0% | 0.00 | 0.0 | 482 | 0 | 6325 | 3.3 | 2751s | 4753s | 252s | 0/0/4 |
+| 168 | 0.0% | 0.00 | 0.0 | 373 | 0 | 6120 | 4.2 | 2694s | 6154s | 250s | 0/0/4 |
+| 169 | 0.0% | 0.00 | 0.0 | 425 | 0 | 4776 | 3.7 | 2623s | 4599s | 247s | 0/0/4 |
+| 170 | 0.0% | 0.00 | 0.0 | 416 | 0 | 6865 | 4.0 | 2509s | 4684s | 247s | 0/0/4 |
+
+*Steps 165-170: Crypto miner at 18000%+ CPU → vLLM 10x slower → agents timeout after 3-6 steps → all ENV_TIMEOUT → score=0, pg_loss=0, grad_norm=0.*
+
+**Phase 3: Post-Miner (Feb 23-24, Steps 171-199, Runs 7-8)**
+
+| Step | Score | pg_loss | pg_clip | entropy | grad_norm | resp_len | traj_steps | llm_time | step_time | PPO_time | solve(a/p/n) |
+|------|-------|---------|---------|---------|-----------|----------|------------|----------|-----------|----------|--------------|
+| 171 | 21.9% | 13.56 | 0.0 | 2735 | 3378 | 23702 | 21.6 | 1018s | 1894s | 121s | 0/2/2 |
+| 172 | 12.5% | 11.46 | 0.0 | 2687 | 2590 | 25791 | 25.3 | 975s | 1559s | 114s | 0/1/3 |
+| 173 | 31.2% | 51.28 | 0.0 | 3629 | 3741 | 24593 | 19.3 | 1145s | 2094s | 118s | 0/2/2 |
+| 174 | 56.2% | 56.41 | 0.0 | 1542 | 3291 | 18138 | 19.1 | 767s | 1864s | 104s | 1/2/1 |
+| 175 | 56.2% | 146.78 | 0.0 | 2798 | 4823 | 17939 | 15.6 | 998s | 1993s | 99s | 0/3/1 |
+| 176 | 34.4% | 49.91 | 0.0 | 2871 | 4539 | 21693 | 21.5 | 942s | 1701s | 112s | 0/3/1 |
+| 177 | 9.4% | 29.52 | 0.0 | 3179 | 2202 | 21831 | 16.5 | 1020s | 1998s | 113s | 0/1/3 |
+| 178 | 18.8% | 19.51 | 0.0 | 3227 | 4226 | 22332 | 22.2 | 957s | 1790s | 112s | 0/3/1 |
+| 179 | 25.0% | 34.46 | 0.0 | 4648 | 3912 | 23057 | 23.8 | 1192s | 2122s | 112s | 0/2/2 |
+| 180 | 21.9% | 202.88 | 0.0 | 4480 | 4318 | 22172 | 17.2 | 1290s | 3448s | 121s | 0/2/2 |
+| 181 | 37.5% | 62.47 | 0.0 | 4872 | 4309 | 25613 | 24.3 | 1123s | 1988s | 131s | 0/3/1 |
+| 182 | 56.2% | -33.10 | 0.0 | 4289 | 5090 | 22082 | 20.2 | 992s | 2072s | 121s | 0/4/0 |
+| 183 | 28.1% | 7.14 | 0.0 | 4612 | 3565 | 22900 | 22.7 | 1038s | 2149s | 110s | 0/2/2 |
+| 184 | 65.6% | 62.27 | 0.0 | 3470 | 4210 | 20407 | 17.8 | 928s | 1977s | 103s | 0/3/1 |
+| 185 | 37.5% | 92.55 | 0.0 | 5011 | 3764 | 22208 | 18.4 | 1083s | 2179s | 114s | 0/2/2 |
+| 186 | 21.9% | 59.04 | 0.0 | 4872 | 3600 | 22750 | 21.0 | 1090s | 1769s | 117s | 0/2/2 |
+| 187 | 28.1% | 21.88 | 0.0 | 4715 | 5021 | 24259 | 21.5 | 1125s | 1780s | 123s | 0/3/1 |
+| 188 | 21.9% | 89.14 | 0.0 | 5160 | 4106 | 24658 | 21.3 | 1154s | 3268s | 122s | 0/2/2 |
+| 189 | 18.8% | 17.14 | 0.0 | 6347 | 4628 | 25892 | 23.7 | 1166s | 1850s | 124s | 0/3/1 |
+| 190 | 50.0% | 0.00 | 0.0 | 4050 | 0 | 21939 | 19.5 | 949s | 1865s | 111s | 2/0/2 |
+| 191 | 25.0% | 28.70 | 0.0 | 4011 | 4577 | 22544 | 21.1 | 1012s | 2167s | 112s | 0/3/1 |
+| 192 | 28.1% | 46.91 | 0.0 | 5193 | 5005 | 26329 | 22.6 | 1090s | 2307s | 128s | 0/3/1 |
+| 193 | 37.5% | -12.19 | 0.0 | 5037 | 4990 | 24542 | 22.3 | 1073s | 2172s | 118s | 0/3/1 |
+| 194 | 21.9% | 12.70 | 0.0 | 4728 | 2772 | 25305 | 21.1 | 946s | 1870s | 124s | 0/1/3 |
+| 195 | 12.5% | 68.24 | 0.0 | 7444 | 4850 | 29151 | 26.5 | 1342s | 2853s | 138s | 0/2/2 |
+| 196 | 21.9% | 1.16 | 0.0 | 6252 | 4297 | 27117 | 24.0 | 1126s | 1903s | 130s | 0/2/2 |
+| 197 | 59.4% | 80.18 | 0.0 | 7472 | 7681 | 24488 | 22.4 | 1139s | 2085s | 118s | 0/3/1 |
+| 198 | 21.9% | 47.45 | 0.0 | 7149 | 4345 | 24357 | 20.5 | 1012s | 1829s | 120s | 0/2/2 |
+| 199 | 34.4% | 54.67 | 0.0 | 5486 | 6014 | 20085 | 18.2 | 971s | 2018s | 114s | 0/3/1 |
+
+**Column Legend**:
+- **Score**: `critic/score/mean` (fraction of rollouts that solved the task)
+- **pg_loss**: `actor/pg_loss` (policy gradient loss)
+- **pg_clip**: `actor/pg_clipfrac` (fraction of samples clipped by PPO — **0.0 for all steps = dead learning**)
+- **entropy**: `actor/entropy` (policy entropy, higher = more exploration)
+- **grad_norm**: `actor/grad_norm` (gradient L2 norm)
+- **resp_len**: `response_length/mean` (tokens per response)
+- **traj_steps**: `traj/steps_mean` (agent interaction steps per trajectory)
+- **llm_time**: `traj/llm_time_mean` (LLM inference time per trajectory)
+- **step_time**: `timing_s/collect_trajectory` (total rollout collection time)
+- **PPO_time**: `timing_s/update_actor` (PPO update time)
+- **solve(a/p/n)**: `batch/solve_all` / `solve_partial` / `solve_none` (4 prompts per batch, each with n=8 rollouts)
+
+**Key Observations**:
+1. **pg_clipfrac = 0.0 for ALL 39 recorded steps** — confirms dead learning (batch=4, mini_batch=4 → only 1 optimizer update/step)
+2. **Entropy rising** from ~1300 (step 1) to ~5000-7000 (steps 190+) — policy becoming MORE random over training, not less
+3. **Steps 165-170 fully zero**: miner caused ENV_TIMEOUT for all trajectories (traj_steps 3-5 vs normal 20+)
+4. **Step 190 anomaly**: pg_loss=0, grad_norm=0 despite score=50% — all 8 rollouts either all-pass or all-fail per prompt, yielding zero advantage variance
+5. **Score range 0-66%** with no trend — fluctuations from data difficulty, not policy improvement
+6. **PPO update time stable** at ~110-130s (post-miner) — Option B (Ulysses=8 single-node) working correctly
+
+**Source files** (on youyun.37, `/home/claude/work/logs/`):
+
+| Log File | Steps | Run |
+|----------|-------|-----|
+| `deepswe_full_20260212_174943.log` | 1-3 | Run 1 start |
+| `deepswe_full_resume.log` | 3-4 | Run 1 resume |
+| `deepswe_full_20260221_step165_170.log` | 165-170 | Run 5 (miner) |
+| `deepswe_full_20260222_zmqcrash_step161.log` | 161 | Run 6 (ZMQ crash) |
+| `deepswe_full_restart_step168.log` | 169-187 | Run 7 |
+| `deepswe_full_restart_step186.log` | 187-199 | Run 8 (final) |
 
 ## 11. Operational Runbook
 
