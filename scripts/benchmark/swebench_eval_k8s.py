@@ -49,9 +49,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "30"))
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "100"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32768"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "true").lower() == "true"
 TESTBED = "/testbed"
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://vllm-qwen3-32b:8000/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "DeepSWE-Step164")
@@ -394,21 +395,35 @@ class K8sPodManager:
 class VLLMCompleter:
     """Completer using vLLM OpenAI-compatible API (text mode, no function calling)"""
 
-    def __init__(self, base_url: str, model: str, max_tokens: int = 4096, temperature: float = 1.0):
+    def __init__(self, base_url: str, model: str, max_tokens: int = 32768,
+                 temperature: float = 1.0, enable_thinking: bool = True):
         self.client = openai.OpenAI(api_key="not-needed", base_url=base_url)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.enable_thinking = enable_thinking
 
-    def complete(self, messages: List[Dict[str, str]]) -> str:
+    def complete(self, messages: List[Dict[str, str]]) -> tuple:
+        """Returns (full_text_for_history, content_for_parsing).
+        When thinking is enabled, full_text includes <think>...</think> tags for conversation history,
+        while content_for_parsing contains only the action text."""
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": self.enable_thinking}},
         )
-        return response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        content = msg.content or ""
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+
+        if reasoning:
+            full_text = f"<think>\n{reasoning}\n</think>\n{content}"
+        else:
+            full_text = content
+
+        return full_text, content
 
 
 class SWEBenchAgent:
@@ -551,13 +566,15 @@ class SWEBenchAgent:
             logger.info(f"[{instance_id}] Step {self.current_step}/{MAX_STEPS}")
 
             try:
-                response = self.completer.complete(self.messages)
+                full_text, action_text = self.completer.complete(self.messages)
             except Exception as e:
                 logger.error(f"[{instance_id}] LLM call failed: {e}")
                 break
 
-            self.messages.append({"role": "assistant", "content": response})
-            action = self._parse_action(response)
+            # Store full text (with thinking) in conversation history
+            self.messages.append({"role": "assistant", "content": full_text})
+            # Parse actions from content only (excluding thinking)
+            action = self._parse_action(action_text)
             logger.info(f"[{instance_id}] Action: {action.get('type', 'unknown')}")
 
             result = self._execute_action(action)
@@ -706,13 +723,13 @@ def evaluate_instance(instance: Dict[str, Any], completer: VLLMCompleter,
 
 
 def main():
-    logger.info(f"Config: model={MODEL_NAME}, steps={MAX_STEPS}, tokens={MAX_TOKENS}, temp={TEMPERATURE}, workers={MAX_WORKERS}, start={START_INDEX}, end={END_INDEX}")
+    logger.info(f"Config: model={MODEL_NAME}, steps={MAX_STEPS}, tokens={MAX_TOKENS}, temp={TEMPERATURE}, thinking={ENABLE_THINKING}, workers={MAX_WORKERS}, start={START_INDEX}, end={END_INDEX}")
 
-    completer = VLLMCompleter(VLLM_BASE_URL, MODEL_NAME, MAX_TOKENS, TEMPERATURE)
+    completer = VLLMCompleter(VLLM_BASE_URL, MODEL_NAME, MAX_TOKENS, TEMPERATURE, ENABLE_THINKING)
 
     # Test connection
     try:
-        test = completer.complete([{"role": "user", "content": "Say hello"}])
+        _, test = completer.complete([{"role": "user", "content": "Say hello"}])
         logger.info(f"vLLM OK: {test[:80]}...")
     except Exception as e:
         logger.error(f"vLLM connection failed: {e}")
