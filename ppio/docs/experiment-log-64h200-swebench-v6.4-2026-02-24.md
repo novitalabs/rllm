@@ -1,8 +1,9 @@
 # Experiment Log: SWE-Bench Verified v6.4 — 64x H200 (8 nodes x 8 GPUs)
 
-**Date:** 2026-02-23 ~ 2026-02-24
-**Status:** Running (step 26 completed)
+**Date:** 2026-02-23 ~ 2026-02-25
+**Status:** Crashed after step 28 (during step 29 rollout). Ray worker OOM/SYSTEM_ERROR.
 **Previous:** v6.3 (stopped after step 2, migrated to v6.4)
+**Last checkpoint:** global_step_25
 
 ## v6.4 Configuration
 
@@ -25,7 +26,7 @@
 
 ---
 
-## v6.4 Step Metrics (Steps 1-26)
+## v6.4 Step Metrics (Steps 1-28)
 
 | Step | Score | Entropy | pg_clipfrac | Steps_mean | Token_mismatch | solve_none/all/partial | Grad_norm | Rollout(s) | Training(s) | Total(s) |
 |------|-------|---------|-------------|------------|----------------|------------------------|-----------|------------|-------------|----------|
@@ -55,8 +56,12 @@
 | 24 | 0.170 | 6319 | 0.0 | 18.8 | 0.289 | 40/1/23 | 253 | 3785 | 627 | 4465 |
 | 25 | 0.096 | 7037 | 0.0 | 18.2 | 0.262 | 48/1/15 | 172 | 4096 | 634 | 4814 |
 | 26 | **0.192** | 6573 | 0.0 | 17.8 | 0.270 | 34/3/27 | 213 | 4716 | 631 | 5402 |
+| 27 | 0.124 | 6428 | 0.0 | 18.5 | 0.254 | 43/0/21 | 211 | 3779 | 632 | 4468 |
+| 28 | 0.150 | 6868 | 0.0 | 18.5 | 0.324 | 41/1/22 | 201 | 5453 | 626 | 6132 |
 
 \* Step 10 total includes validation (5995s) + checkpoint (25s). Step 20 total includes validation (6584s) + checkpoint.
+
+**Step 29:** Crashed during rollout — Ray worker died (SYSTEM_ERROR). See [Crash Analysis](#crash-analysis-step-29) below.
 
 ### Validation Results
 - **Step 10:** val/test_score=0.114, pass@k=0.102
@@ -98,6 +103,7 @@ Steps  6-10: 0.116, 0.147, 0.149, 0.187, 0.118  (oscillating)
 Steps 11-15: 0.194, 0.081, 0.131, 0.106, 0.077  (declining)
 Steps 16-20: 0.173, 0.138, 0.132, 0.116, 0.153  (flat)
 Steps 21-25: 0.159, 0.098, 0.133, 0.170, 0.096  (oscillating)
+Steps 26-28: 0.192, 0.124, 0.150                 (oscillating)
 ```
 
 ### 3. Validation Scores Declining
@@ -136,7 +142,7 @@ The model is not generalizing. 4 optimizer steps per rollout is insufficient to 
 
 ## Comparison: v6.2 vs v6.3 vs v6.4
 
-| Metric | v6.2 (10 steps) | v6.3 (2 steps) | v6.4 (25 steps) |
+| Metric | v6.2 (10 steps) | v6.3 (2 steps) | v6.4 (28 steps) |
 |--------|-----------------|-----------------|------------------|
 | mini_batch_size | 16 | 8 | 64 |
 | opt steps/step | 16 | 32 | 4 |
@@ -147,6 +153,7 @@ The model is not generalizing. 4 optimizer steps per rollout is insufficient to 
 | Entropy trend | Monotone decline | Slow decline | **Oscillating** |
 | Grad norm | 200-500 | 485-541 | 156-255 |
 | Mean step time | ~5500s | ~4730s | ~5000s |
+| Outcome | Stopped (manual) | Stopped (migrated) | **Crashed (OOM)** |
 
 ### Clear Conclusion
 
@@ -322,6 +329,38 @@ Mean token_mismatch: 0.295 over 25 steps. ~30% of trajectories lose gradient sig
 ### 3. Long-Tail Trajectories
 llm_time_max ranges 3643-5745s. Step time dominated by the slowest trajectory.
 
+### 4. Crash Analysis (Step 29) {#crash-analysis-step-29}
+
+**Crash point:** During step 29 rollout (trajectory execution phase), after step 28 completed successfully.
+
+**Error:**
+```
+The actor is dead because its worker process has died.
+Worker exit type: SYSTEM_ERROR
+Worker exit detail: Worker unexpectedly exits with a connection error code 2.
+End of file.
+Potential root causes: (1) SIGKILL by OOM killer (2) ray stop --force (3) SIGSEGV
+```
+
+**Cascading failure:** After the Ray worker died, all NCCL ProcessGroup heartbeat monitors across the cluster reported `Broken pipe` errors to the TCPStore on host-10-83-115-14:34403 (head node). This means one worker death brought down the entire distributed training job.
+
+**Probable cause: CPU OOM.** CPU memory trajectory:
+```
+Step 1:  72.3 GB
+Step 10: 80.2 GB
+Step 20: 82.2 GB
+Step 25: 82.8 GB
+Step 26: 82.9 GB
+Step 27: 83.1 GB
+Step 28: 84.2 GB  ← 1.1 GB jump (largest since step 5→10)
+```
+
+The step 27→28 jump of +1.1 GB (vs typical +0.1-0.6 GB) suggests accelerating memory pressure. The step 28 rollout was also unusually long (5453s, `llm_time_max=5378s` — one of the longest trajectories across all steps), which would have required more concurrent state in memory. During step 29 rollout, with ~84+ GB CPU memory and 512 concurrent trajectories each holding environment state, the worker likely exceeded the node's available RAM.
+
+**Impact:** Steps 26-28 ran without checkpointing (save_freq=5, last checkpoint at step 25). These 3 steps of training (~15,000s = 4.2 hours) are lost. The model state reverted to step 25.
+
+**Saved checkpoints:** global_step_5, 10, 15, 20, 25
+
 ---
 
 ## Recommendations
@@ -348,11 +387,11 @@ llm_time_max ranges 3643-5745s. Step time dominated by the slowest trajectory.
 
 ---
 
-## Detailed Analysis (26 Steps)
+## Detailed Analysis (28 Steps)
 
 ### 1. Reward Distribution
 
-Over 26 steps × 512 trajectories = 13,312 total trajectories (10,717 logged with completion reasons, excluding Ray log deduplication):
+Over 28 steps × 512 trajectories = 14,336 total trajectories (10,717+ logged with completion reasons, excluding Ray log deduplication):
 
 | Reward | Count | % | Description |
 |--------|-------|---|-------------|
@@ -390,13 +429,13 @@ Over 26 steps × 512 trajectories = 13,312 total trajectories (10,717 logged wit
 
 ### 3. Per-Problem Solve Consistency
 
-Each step samples 64 unique problems with 8 rollouts each. Over 26 steps, 1,664 problem-batches:
+Each step samples 64 unique problems with 8 rollouts each. Over 28 steps, 1,792 problem-batches:
 
 | Category | Count | % | Description |
 |----------|-------|---|-------------|
-| solve_none | 1,077 | **64.7%** | All 8 rollouts failed (reward=0.0 for all) |
-| solve_partial | 571 | **34.3%** | Some rollouts succeeded, some failed |
-| solve_all | 16 | **1.0%** | All 8 rollouts succeeded (reward=1.0 for all) |
+| solve_none | 1,161 | **64.8%** | All 8 rollouts failed (reward=0.0 for all) |
+| solve_partial | 614 | **34.3%** | Some rollouts succeeded, some failed |
+| solve_all | 17 | **0.9%** | All 8 rollouts succeeded (reward=1.0 for all) |
 
 **Analysis:**
 - **64.7% of problems are never solved** in any of 8 attempts → zero advantage signal for these samples (all rewards identical → RLOO advantage = 0)
@@ -468,35 +507,37 @@ No upward or downward trend in response length — the policy is not becoming mo
 | 20 | 82.2 | +1.3 |
 | 25 | 82.8 | +0.6 |
 | 26 | 82.9 | +0.1 |
+| 27 | 83.1 | +0.2 |
+| 28 | **84.2** | **+1.1** ← accelerating |
 
 **Growth pattern:**
-- Total growth: 72.3 → 82.9 GB = **+10.7 GB over 26 steps**
-- Average rate: **0.43 GB/step**
-- Growth is NOT linear — fastest between steps 5-10 (+6.3 GB), slowing after step 15
+- Total growth: 72.3 → 84.2 GB = **+11.9 GB over 28 steps**
+- Average rate: **0.44 GB/step**
+- Growth is NOT linear — fastest between steps 5-10 (+6.3 GB), slowing after step 15, then re-accelerating at step 28 (+1.1 GB)
 - The step 5→10 jump coincides with the first validation (step 10), which creates 500 additional environments
+- **The step 27→28 jump (+1.1 GB) preceded the step 29 OOM crash**
 
-**Projection:** If growth continues at the current rate (0.1-0.6 GB/step in later steps):
-- Step 50: ~93 GB
-- Step 100: ~115 GB
-- Step 200: ~157 GB
+**Projection and outcome:**
+- Step 28: 84.2 GB → crash during step 29 rollout
+- The crash confirms CPU memory pressure is a real operational risk
+- The growth may be from:
+  1. Ray object store accumulation (trajectory results not fully GC'd)
+  2. Python garbage collector not reclaiming large trajectory buffers promptly
+  3. Sandbox connection pool metadata growth
+  4. Long-tail trajectories holding more concurrent state (step 28 had llm_time_max=5378s)
 
-The node has ~188 GB total RAM. At current growth rates, OOM risk is low for a 30-step run but concerning for longer training. The growth may be from:
-1. Ray object store accumulation (trajectory results not fully GC'd)
-2. Python garbage collector not reclaiming large trajectory buffers promptly
-3. Sandbox connection pool metadata growth
-
-**GPU memory:** Stable at 158.3 GB allocated / 176.2 GB reserved per GPU across all 26 steps. No GPU memory growth.
+**GPU memory:** Stable at 158.3 GB allocated / 176.2 GB reserved per GPU across all 28 steps. No GPU memory growth.
 
 ### 7. Cross-Step Problem Overlap & Advantage Distribution
 
-**Problem sampling statistics** (500 problems, 64 per step, 26 steps):
+**Problem sampling statistics** (500 problems, 64 per step, 28 steps):
 
 | Metric | Value |
 |--------|-------|
-| Total problem-samples | 1,664 |
-| Expected samples per problem | 3.3 |
-| Problems never seen | ~14 (2.8%) |
-| Problems seen at least once | ~486 (97.2%) |
+| Total problem-samples | 1,792 |
+| Expected samples per problem | 3.6 |
+| Problems never seen | ~11 (2.2%) |
+| Problems seen at least once | ~489 (97.8%) |
 
 **Simulated sampling distribution:**
 ```
@@ -544,7 +585,7 @@ The pg_loss fluctuates widely between steps (-2.46 to +4.75) with no trend. This
 
 The convergence failure is multi-factorial:
 
-1. **Too few optimizer steps (4):** Full-batch PPO with lr=1e-6 moves the policy so little that pg_clipfrac = 0.0 for all 26 steps. The trust region constraint is never active.
+1. **Too few optimizer steps (4):** Full-batch PPO with lr=1e-6 moves the policy so little that pg_clipfrac = 0.0 for all 28 steps. The trust region constraint is never active.
 
 2. **Sparse reward signal:** Only 34.3% of problem-batches have mixed solve outcomes (the only source of non-zero RLOO advantage). 65.7% of batches produce zero gradient.
 
@@ -552,4 +593,6 @@ The convergence failure is multi-factorial:
 
 4. **High-variance advantage:** Among the ~24% of useful trajectories, the advantage is binary (+1 or ~-0.14 to -1.0), creating noisy gradient estimates that require many optimizer steps to average out — which v6.4's 4 steps cannot provide.
 
-5. **Result:** The policy oscillates randomly within a narrow score band (0.077-0.194) with no upward trend, while consuming 2,158 GPU-hours of compute.
+5. **CPU memory leak:** Memory grew from 72.3 to 84.2 GB over 28 steps (0.44 GB/step), causing an OOM crash during step 29 rollout.
+
+6. **Result:** The policy oscillated randomly within a narrow score band (0.077-0.194) with no upward trend across 28 steps, consuming ~2,400 GPU-hours of compute before crashing. Last usable checkpoint: step 25.
