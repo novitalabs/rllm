@@ -265,23 +265,64 @@ initContainers:
 
 4578 unique Docker images across 10 repos:
 
-| Repository | Count | % of dataset |
-|-----------|-------|-------------|
-| `namanjain12/pandas_final` | 1444 | 31.5% |
-| `namanjain12/numpy_final` | 781 | 17.1% |
-| `namanjain12/pillow_final` | 620 | 13.5% |
-| `namanjain12/orange3_final` | 482 | 10.5% |
-| `namanjain12/aiohttp_final` | 299 | 6.5% |
-| `namanjain12/tornado_final` | 261 | 5.7% |
-| `namanjain12/scrapy_final` | 215 | 4.7% |
-| `namanjain12/pyramid_final` | 189 | 4.1% |
-| `namanjain12/datalad_final` | 179 | 3.9% |
-| `namanjain12/coveragepy_final` | 108 | 2.4% |
+| Repository | Count | % | Unique/Img | Est. Total Unique |
+|-----------|-------|---|-----------|-------------------|
+| `namanjain12/pandas_final` | 1444 | 31.5% | ~1.3GB | ~1.9TB |
+| `namanjain12/numpy_final` | 781 | 17.1% | 1.3GB | 1.0TB |
+| `namanjain12/pillow_final` | 620 | 13.5% | 1.1GB | 0.7TB |
+| `namanjain12/orange3_final` | 482 | 10.5% | 2.4GB | ~1.2TB |
+| `namanjain12/aiohttp_final` | 299 | 6.5% | 1.2GB | 0.35TB |
+| `namanjain12/tornado_final` | 261 | 5.7% | 0.9GB | 0.22TB |
+| `namanjain12/scrapy_final` | 215 | 4.7% | 0.9GB | 0.19TB |
+| `namanjain12/pyramid_final` | 189 | 4.1% | 0.9GB | 0.16TB |
+| `namanjain12/datalad_final` | 179 | 3.9% | 1.6GB | 0.29TB |
+| `namanjain12/coveragepy_final` | 108 | 2.4% | 0.8GB | 0.07TB |
+| **Total** | **4578** | | | **~6.1TB** |
 
-Images within the same repo share base layers → on-disk total is much less than count × size.
-On youyun.37, 3145 images (Docker) = ~3.3TB with layer sharing.
+**Measured data** (from youyun.37, Docker overlay2):
+- 2642 images (all except pandas + most orange3) = **3.2TB actual disk**
+- Cross-repo layer sharing is minimal (dedup ratio only 9%) — most layers are unique per image
+- pandas and orange3 are estimated from per-image unique sizes of similar repos
 
-### 4.2 Generate image list
+### 4.2 Disk budget per k8s node
+
+Each k8s worker node's containerd NVMe (confirmed from host-10-83-115-21):
+
+```
+/dev/nvme0n1  7.0T  434G  6.6T  6%  /var/lib/containerd
+/dev/nvme1n1  7.0T  294G  6.7T  4%  /data
+```
+
+Current 434GB usage = ~50 swebench-verified eval images + system images.
+
+| Strategy | Per-Node Disk | Total (8 nodes) | Utilization | Headroom |
+|----------|-------------|-----------------|-------------|----------|
+| **A: All on all** | ~6.1TB + 0.4TB = 6.5TB | 48.8TB pulls | 93% of 7TB | **~500GB** ⚠️ |
+| **B: Distributed (2 copies)** | ~1.5TB avg + 0.4TB = ~1.9TB | 12.2TB pulls | 27% of 7TB | **~5.1TB** ✓ |
+
+**Strategy A is risky** — 500GB headroom leaves no margin for containerd overhead, writable container layers, logs, or unexpected growth. Strategy B is recommended.
+
+### 4.3 Recommended: Distributed pre-pull (2 copies per image)
+
+Each image is pre-pulled on **2 out of 8 nodes**. This provides redundancy while keeping disk usage manageable.
+
+**How k8s scheduling interacts with distributed images**:
+- The k8s default scheduler includes an `ImageLocality` scoring plugin that gives bonus points to nodes already having the required image
+- With 8 identical nodes (same CPU/RAM/GPU), ImageLocality becomes the dominant differentiator
+- `imagePullPolicy: IfNotPresent` (the default for tagged images) means: if a pod lands on a node without the image, it falls back to pulling — slower but not fatal
+
+**Repo-to-node assignment** (balanced by total unique size, 2 copies each):
+
+| Nodes | Repos | Est. Disk |
+|-------|-------|-----------|
+| Node 1, Node 2 | pandas (1.9TB) | ~1.9TB |
+| Node 3, Node 4 | numpy (1.0TB) + orange3 (1.2TB) | ~2.2TB |
+| Node 5, Node 6 | pillow (0.7TB) + aiohttp (0.35TB) + datalad (0.29TB) | ~1.3TB |
+| Node 7, Node 8 | tornado (0.22TB) + scrapy (0.19TB) + pyramid (0.16TB) + coveragepy (0.07TB) | ~0.6TB |
+
+Max per node: ~2.2TB + 0.4TB existing = 2.6TB → 37% utilization → comfortable.
+
+### 4.4 Generate image list
 
 ```bash
 ssh youyun.37 'source /home/claude/work/rllm-origin/.venv/bin/activate && python3 -c "
@@ -291,88 +332,30 @@ for row in df[\"extra_info\"]:
     info = json.loads(row) if isinstance(row, str) else row
     print(info.get(\"docker_image\", \"\"))
 " > /nfs/r2e_training_images.txt'
-```
 
-### 4.3 Pre-pull strategy: k8s batch Jobs
-
-Each k8s Job creates a pod on a `workload=r2e-eval` node, pulling the image as a side effect. The pod exits immediately after start, but the image stays cached in containerd.
-
-```bash
-# Generate and apply k8s Jobs for all images (on youyun.37):
+# Also generate per-repo lists for targeted pre-pull:
 ssh youyun.37 'source /home/claude/work/rllm-origin/.venv/bin/activate && python3 << "PYEOF"
 import json, pandas as pd
 
 df = pd.read_parquet("/home/claude/work/rllm-origin/rllm/data/datasets/R2E_Gym_Subset/train_verl.parquet")
-images = []
+repos = {}
 for row in df["extra_info"]:
     info = json.loads(row) if isinstance(row, str) else row
-    images.append(info.get("docker_image", ""))
-
-# Group by repo
-repos = {}
-for img in images:
+    img = info.get("docker_image", "")
     repo = img.split(":")[0].split("/")[-1]
     repos.setdefault(repo, []).append(img)
 
-# Generate k8s Job manifests (one per image)
-with open("/nfs/prepull-jobs.yaml", "w") as f:
-    for repo, imgs in sorted(repos.items()):
-        for i, img in enumerate(imgs):
-            safe_name = f"prepull-{repo}-{i:04d}"[:63]  # k8s name limit
-            f.write(f"""---
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: {safe_name}
-  labels:
-    app: prepull
-    repo: {repo}
-spec:
-  ttlSecondsAfterFinished: 60
-  backoffLimit: 2
-  template:
-    spec:
-      containers:
-      - name: pull
-        image: {img}
-        command: ["echo", "pulled"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-      restartPolicy: Never
-      imagePullSecrets:
-      - name: dockerhub
-      nodeSelector:
-        workload: r2e-eval
-""")
-
-print(f"Generated {len(images)} Jobs to /nfs/prepull-jobs.yaml")
+for repo, imgs in sorted(repos.items()):
+    with open(f"/nfs/r2e_images_{repo}.txt", "w") as f:
+        for img in imgs:
+            f.write(img + "\n")
+    print(f"{repo}: {len(imgs)} images -> /nfs/r2e_images_{repo}.txt")
 PYEOF'
 ```
 
-Apply in batches (to avoid overwhelming the API server and Docker Hub):
+### 4.5 Pre-pull with DaemonSet (targeted per node group)
 
-```bash
-# Apply 100 at a time, wait for completion, repeat
-# Split the YAML file by "---" separator:
-csplit /nfs/prepull-jobs.yaml '/^---$/' '{*}' --prefix=/nfs/prepull-batch- --suffix-format='%04d.yaml'
-
-# Apply batch:
-for batch in /nfs/prepull-batch-*.yaml; do
-    kubectl apply -f "$batch"
-    sleep 2  # throttle API server
-done
-
-# Monitor progress:
-kubectl get jobs -l app=prepull --no-headers | wc -l        # total
-kubectl get jobs -l app=prepull --no-headers | grep "1/1" | wc -l  # completed
-kubectl get jobs -l app=prepull --no-headers | grep "0/1" | wc -l  # pending/running
-```
-
-### 4.4 Alternative: privileged DaemonSet with crictl
-
-Deploy a privileged DaemonSet on each node that can pull images directly:
+Deploy privileged DaemonSet on each node to pull images via `ctr`:
 
 ```yaml
 # prepull-daemonset.yaml
@@ -416,22 +399,51 @@ spec:
       - name: dockerhub
 ```
 
-Then exec into each pod and batch-pull:
+Then exec into specific node's puller pod and pull the assigned repos:
 
 ```bash
-# On each puller pod:
-kubectl exec image-puller-XXXXX -- sh -c '
+# Apply DaemonSet (one pod per node):
+kubectl apply -f prepull-daemonset.yaml
+
+# Get puller pod names and their nodes:
+kubectl get pods -l app=image-puller -o wide --no-headers
+
+# For each node group, exec into the corresponding puller pod and pull assigned repos.
+# Example: Node 1 (host-10-83-115-18) gets pandas_final:
+PULLER_POD=$(kubectl get pods -l app=image-puller -o wide --no-headers | grep "host-10-83-115-18" | awk '{print $1}')
+kubectl exec $PULLER_POD -- sh -c '
   apk add --no-cache containerd-ctr
   while read img; do
     ctr -n k8s.io images pull "docker.io/$img" && echo "OK: $img" || echo "FAIL: $img"
-  done < /nfs/r2e_training_images.txt
+  done < /nfs/r2e_images_pandas_final.txt
 '
+
+# Repeat for other node-repo assignments per the table above.
+# Throttle to avoid Docker Hub 429: max_concurrent_downloads=20 is already set in containerd config.
 ```
 
-### 4.5 Disk estimate
+### 4.6 Alternative: all-on-all via official DaemonSet script
 
-- Per node (all images): ~1-2TB with layer dedup. 7TB NVMe available → OK.
-- Practical: k8s distributes pods → each node caches a subset. ~500GB-1TB typical.
+If disk headroom is acceptable (~500GB), use the official approach from `rllm-origin/rllm/environments/swe/cache_images_k8.py` which creates a DaemonSet per image (no nodeSelector → pulls on ALL nodes). This is simpler but uses ~6TB per node.
+
+```bash
+# On youyun.37, inside rllm-origin venv:
+cd /home/claude/work/rllm-origin
+python rllm/environments/swe/cache_images_k8.py
+# Uses 48 concurrent threads, creates/deletes DaemonSets per image.
+# Each DaemonSet pulls the image on all 8 worker nodes simultaneously.
+```
+
+### 4.7 Monitoring pre-pull progress
+
+```bash
+# Check containerd image count/size on each node:
+for pod in $(kubectl get pods -l app=image-puller -o name); do
+  node=$(kubectl get $pod -o jsonpath='{.spec.nodeName}')
+  count=$(kubectl exec ${pod##*/} -- sh -c 'ctr -n k8s.io images ls -q 2>/dev/null | wc -l')
+  echo "$node: $count images"
+done
+```
 
 ---
 
@@ -789,11 +801,14 @@ Before full training, run 2 steps with `trainer.total_training_steps=2` and `dat
 - [ ] Bind to `swebench-eval-role` (pod create/delete/exec/log)
 - [ ] Verify `dockerhub` imagePullSecret exists
 
-### Phase 4: Pre-Pull R2E-Gym Training Images
-- [ ] Generate image list from training parquet (4578 images)
-- [ ] Create pre-pull Jobs (batch by repo, throttle to avoid Docker Hub rate limits)
-- [ ] Priority: pandas (1444), numpy (781), pillow (620) = 62% of dataset
-- [ ] Monitor: `kubectl get jobs -l app=prepull | grep "1/1" | wc -l`
+### Phase 4: Pre-Pull R2E-Gym Training Images (~6.1TB total, distributed)
+- [ ] Generate per-repo image lists from training parquet (4578 images, 10 repos)
+- [ ] Deploy image-puller DaemonSet on all 8 worker nodes
+- [ ] Pre-pull pandas_final on Node 1+2 (~1.9TB each)
+- [ ] Pre-pull numpy_final + orange3_final on Node 3+4 (~2.2TB each)
+- [ ] Pre-pull pillow_final + aiohttp_final + datalad_final on Node 5+6 (~1.3TB each)
+- [ ] Pre-pull tornado_final + scrapy_final + pyramid_final + coveragepy_final on Node 7+8 (~0.6TB each)
+- [ ] Monitor: `ctr -n k8s.io images ls -q | wc -l` per node via puller pods
 
 ### Phase 5: KubeRay
 - [ ] Install Helm on youyun.37
@@ -924,15 +939,17 @@ ibstat | grep -E "CA |State|Rate" | head -20
 **Problem in 2-node run**: Two disk-full incidents. Docker images (6TB) and checkpoints (~60GB each) exhausted the 880GB SSD.
 
 **K8s differences**:
-- K8s nodes have 7TB NVMe for containerd + 7TB NVMe `/data` → much more headroom
-- However, 4578 R2E-Gym training images (~2-3TB with dedup) + checkpoints can still accumulate
+- K8s nodes have 7TB NVMe for containerd (`/var/lib/containerd`) + 7TB NVMe (`/data`)
+- With distributed pre-pull (Step 4.3): max ~2.2TB images per node → 37% utilization → safe
+- All-on-all would use ~6.5TB/7TB (93%) → no margin → avoid
 - Containerd does NOT auto-prune unused images (unlike Docker with `docker system prune`)
+- Runtime fallback pulls (ImageLocality miss) will gradually increase per-node image count
 
 **Mitigation**:
-- Monitor disk usage: deploy a DaemonSet that logs `df -h /var/lib/containerd` periodically
+- Use distributed pre-pull strategy (2 copies per image) to keep per-node disk under 3TB
+- Monitor disk usage via puller DaemonSet: `df -h /var/lib/containerd` on each node
 - Checkpoint pruning: `trainer.max_actor_ckpt_to_keep=3` limits to 3 checkpoints on NFS
-- If containerd disk fills up: `crictl rmi --prune` removes unused images (requires privileged access)
-- Pre-pull only the most common images first (pandas=31%, numpy=17%, pillow=14% → 63% coverage with 2845 images)
+- If containerd disk grows beyond 5TB: `crictl rmi --prune` on affected nodes (via privileged pod)
 
 ---
 
@@ -1070,7 +1087,7 @@ The R2E-Gym k8s backend creates env pods with `nodeSelector: {workload: r2e-eval
 - 64 pods / 8 nodes = ~8 pods/node — trivial for 192-CPU nodes, so no resource contention
 - Ray training pods and env pods share the same nodeSelector (`workload: r2e-eval`), so they co-locate on the same nodes. This is fine since env pods use negligible resources compared to GPU training
 
-**Critical: image pre-pull must cover ALL 8 nodes**. The scheduler does NOT consider whether the required Docker image is already cached on a node. If a pod lands on a node without the image, it triggers a runtime pull → slow startup + Docker Hub 429 risk. The official pre-pull script (`rllm-origin/rllm/environments/swe/cache_images_k8.py`) confirms this: it uses DaemonSets with no nodeSelector to pull every image on ALL schedulable nodes.
+**Image locality and distributed pre-pull**: The k8s default scheduler has an `ImageLocality` scoring plugin that prefers nodes already having the required image. With the distributed pre-pull strategy (2 copies per image, see Step 4.3), the scheduler will route env pods toward nodes that have the image cached. If a pod lands on a node without the image, `imagePullPolicy: IfNotPresent` triggers a fallback runtime pull — slower but functional. Over time, hot images may spread to more nodes organically.
 
 **Optional improvement**: Add `topologySpreadConstraints` to the R2E-Gym pod spec to enforce even distribution, but this is unlikely to be necessary in practice given the small pod-to-node ratio.
 
