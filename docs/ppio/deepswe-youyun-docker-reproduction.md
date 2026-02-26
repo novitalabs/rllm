@@ -542,9 +542,94 @@ python -m rllm.trainer.verl.merge_fsdp_to_hf \
 
 ---
 
+## 14. Training Logs Archive
+
+All training logs have been backed up to `/home/claude/work/rllm-origin/logs_backup/` (257MB total).
+See `logs_backup/README.md` for full index.
+
+### Directory Structure
+
+```
+logs_backup/                                          # 257MB total
+├── ray_sessions/                                     # Compressed Ray worker logs
+│   ├── session_2026-02-22_14-49-49_472914.tar.gz     #  190K — Run 5, Option A TP=8 attempt
+│   ├── session_2026-02-22_15-43-40_745323.tar.gz     #  6.7M — Run 5/6, Option B early attempts
+│   ├── session_2026-02-22_17-27-14_917894.tar.gz     #  1.9M — Run 6, batch=1 test
+│   ├── session_2026-02-22_18-39-40_482380.tar.gz     #  1.9M — Run 7, crypto miner impacted
+│   ├── session_2026-02-22_19-21-47_425549.tar.gz     #  2.4M — Run 7 restart
+│   ├── session_2026-02-22_20-17-23_804434.tar.gz     #  8.1M — Run 7 continued (miner killed)
+│   ├── session_2026-02-22_23-53-32.tar.gz            #   35M — Run 8 START (steps 0→~60)
+│   ├── session_2026-02-23_15-03-44.tar.gz            #   72M — Run 8 RESTART (steps ~60→~140)
+│   ├── session_2026-02-24_09-25-28.tar.gz            #  101M — Run 8 FINAL (steps ~140→200) ✓
+│   └── session_2026-02-26_11-43-21.tar.gz            #   25M — Post-training evaluation session
+├── hydra_configs/outputs/                            # Hydra config snapshots per launch
+│   ├── 2026-02-10/  (23 sessions)                    # batch=8→2, tp=8 (single-node)
+│   ├── 2026-02-11/  (4 sessions)                     # batch=2, tp=8
+│   ├── 2026-02-12/  (15 sessions)                    # batch=4, tp=8 (Option A)
+│   ├── 2026-02-13/  (1 session)                      # batch=4, tp=16 (Option B first)
+│   ├── 2026-02-14~24/                                # batch=4, tp=16 (production)
+│   └── Each session contains: .hydra/{config.yaml, hydra.yaml, overrides.yaml}
+├── training_scripts/                                 # All 9 training shell scripts
+│   ├── train_deepswe_full.sh                         # Final production script (Option B)
+│   ├── train_deepswe_multinode.sh                    # Multi-node variant
+│   └── ... (7 more variants)
+├── experimental_scripts/                             # From git stash (4 files)
+│   ├── train_deepswe_tp8.sh                          # TP=8 Option A variant
+│   ├── train_deepswe_tp8_force_local.sh
+│   ├── train_deepswe_no_ckpt.sh
+│   └── train_minimal_test.sh
+├── diagnostic_reports/                               # From git stash (6 reports)
+│   ├── STATUS_REPORT.md
+│   ├── debugging_summary.md
+│   ├── final_diagnosis.md
+│   ├── immediate_findings.md
+│   ├── training_status.md
+│   └── vllm_throughput_analysis.md
+└── misc_logs/
+    ├── vllm_server.log                               # 293K — Early standalone vLLM test
+    └── monitor_output.log                            # 11K — Early Docker monitoring
+```
+
+### Run 8 Ray Session ↔ Hydra Config Mapping
+
+| Segment | Ray Session | Hydra Config | Steps | Size (compressed) |
+|---------|------------|-------------|-------|--------------------|
+| Start | `session_2026-02-22_23-53-32` | `outputs/2026-02-22/23-54-23/` | 0 → ~60 | 35M |
+| Restart 1 | `session_2026-02-23_15-03-44` | `outputs/2026-02-23/15-04-21/` | ~60 → ~140 | 72M |
+| Restart 2 | `session_2026-02-24_09-25-28` | `outputs/2026-02-24/09-25-56/` | ~140 → 200 | 101M |
+
+### Configuration Evolution (from Hydra overrides)
+
+| Date Range | Sessions | batch_size | TP | Architecture |
+|-----------|----------|------------|-----|--------------|
+| Feb 10 (early) | 11 | 8 | 8 | Single-node, Option A |
+| Feb 10 (late)–11 | 16 | 2 | 8 | Reduced batch, Option A |
+| Feb 12 | 15 | 4 | 8 | Option A experiments |
+| Feb 13–24 | 73 | 4 | 16 (mostly) | Option B production |
+
+### Extracting Logs
+
+```bash
+# Extract a specific Ray session
+cd /home/claude/work/rllm-origin/logs_backup/ray_sessions/
+tar xzf session_2026-02-24_09-25-28.tar.gz
+
+# View Hydra config for a specific launch
+cat hydra_configs/outputs/2026-02-22/23-54-23/.hydra/overrides.yaml
+```
+
+### Not Backed Up
+
+- **Checkpoints** (2.2TB in `checkpoints/`): Too large. 7 checkpoint dirs exist: `deepswe-full`, `deepswe-minimal`, `deepswe-minimal-optionb`, `deepswe-r2egym`, `deepswe-reproduction`, `merge_step164`, `merge_step198`
+- **Original Ray logs** (5.7GB in `/tmp/ray/`): Ephemeral, will be lost on reboot. The compressed backups above are the preserved copies.
+- **wandb logs**: Training ran with `WANDB_MODE=disabled`
+
+---
+
 ## Related Documents
 
 - [deepswe-youyun-kubernetes-reproduction.md](deepswe-youyun-kubernetes-reproduction.md) — K8s 8-node (64 GPU) reproduction plan
+- [logs_backup/README.md](../../logs_backup/README.md) — Full log archive index (257MB)
 - PPIO experiment docs: `/home/claude/work/rllm/ppio/docs/` (19 files, v1~v6.4)
 - Diary entries: `diary-job/2026/0212.md` through `0225.md`
 - Local memo: `diary-job/memo/rl-finetune/deepswe-youyun-reproduction.md`

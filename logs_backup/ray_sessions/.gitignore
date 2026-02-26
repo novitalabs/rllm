@@ -1,0 +1,2 @@
+# Large compressed logs - not tracked in git
+*.tar.gz
