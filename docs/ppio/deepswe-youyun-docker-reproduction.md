@@ -17,7 +17,7 @@ Reproduce [Together AI's DeepSWE](https://together.ai/blog/deepswe-agentic-swe-b
 | Item | Value |
 |------|-------|
 | Framework | rLLM (Agentica's RL post-training framework) |
-| Algorithm | GRPO++ (RLOO + Clip High + No KL Loss + Compact Filtering) |
+| Algorithm | GRPO++ (RLOO advantage + Clip High + No KL Loss + Compact Filtering) |
 | Base Model | Qwen3-32B (pure RL, no SFT) |
 | Hardware | 64 H100 GPUs for 6 days |
 | Batch Size | 64 with 8 passes (512 concurrent Docker containers) |
@@ -107,7 +107,7 @@ Feb 10   Feb 12    Feb 14    Feb 16    Feb 18    Feb 20    Feb 22    Feb 24
 
 | Parameter | Initial (Feb 12) | Final (Feb 24) | When Changed |
 |-----------|------------------|----------------|--------------|
-| `algorithm.adv_estimator` | `rloo` | `grpo` | Feb 14 |
+| `algorithm.adv_estimator` | `rloo` | `grpo` | Feb 12 (16:34, 5 runs in) |
 | `total_training_steps` | 20 | 200 | Feb 14 |
 | `test_freq` | 5 → 20 | 200 | Feb 14 (validation hang) |
 | `save_freq` | 5 | 2 | Feb 14 |
@@ -198,7 +198,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
 
 | Parameter | Official (64 H100) | Ours (16 H200) | Impact |
 |-----------|--------------------|-----------------| -------|
-| `algorithm` | GRPO++ (RLOO) | `grpo` | Different advantage estimator |
+| `algorithm.adv_estimator` | `rloo` (official) | `grpo` | We switched from rloo to grpo on Feb 12; never switched back |
 | `batch_size` | 64 | **4** | 16× smaller → less reward signal |
 | `ppo_mini_batch_size` | 8 | **4** | |
 | `ppo_epochs` | 4 (default) | **1** (implicit) | 32× fewer optimizer steps/step |
@@ -421,7 +421,7 @@ Our config (`batch_size=4, mini_batch_size=4`) → **only 1 optimizer update per
 2. **Crypto miner (Steps 161-170)**: 10 steps with zero learning due to CPU contention
 3. **ZMQ instability**: 5 crashes from cross-node TP=16 ZMQ communication
 4. **Disk space**: 3 disk-full incidents requiring manual cleanup
-5. **Different algorithm**: Used `grpo` instead of `rloo` (official)
+5. **Different adv_estimator**: Used `grpo` instead of `rloo` (official DeepSWE uses RLOO per `examples/swe/train_deepswe_32b.sh`)
 6. **Different temperature**: 0.6 instead of 1.0 (official)
 7. **Half agent budget**: `max_steps=50` instead of 100 (official)
 
