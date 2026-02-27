@@ -1,0 +1,24 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ Description: In _reshape_kv_cache_tensors(), store intermediate view tensor
+@@ references to prevent GC from invalidating the permuted tensor's storage.
+@@
+ # Original code (around line 4870):
+-                    kv_caches[layer_name] = (
+-                        kv_cache_raw_tensors[layer_name]
+-                        .view(dtype)
+-                        .view(kv_cache_shape)
+-                        .permute(*inv_order)
+-                    )
++                    # Preserve intermediate tensor views as instance attrs
++                    # to prevent GC from invalidating the permuted tensor's
++                    # storage between profile_run and first execute_model.
++                    _raw = kv_cache_raw_tensors[layer_name]
++                    _typed = _raw.view(dtype)
++                    _shaped = _typed.view(kv_cache_shape)
++                    _permuted = _shaped.permute(*inv_order)
++                    kv_caches[layer_name] = _permuted
++                    # Keep references alive on the instance
++                    if not hasattr(self, '_kv_cache_view_refs'):
++                        self._kv_cache_view_refs = []
++                    self._kv_cache_view_refs.extend([_raw, _typed, _shaped])

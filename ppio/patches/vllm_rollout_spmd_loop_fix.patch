@@ -1,0 +1,19 @@
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -569,15 +569,16 @@
+     async def _loop_forever(self):
+         while True:
+             try:
+                 message = await self.socket.recv()
+                 method, args, kwargs = pickle.loads(message)
+                 result = await self._execute_method(method, *args, **kwargs)
+                 await self.socket.send(pickle.dumps(result))
+             except Exception as e:
+-                logger.error(f"vLLMAsyncRollout _loop_forever error: {e}")
+-                break
++                logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
++                try:
++                    await self.socket.send(pickle.dumps(e))
++                except Exception:
++                    pass
++                # Do NOT break - continue processing to avoid deadlocking the TP group
