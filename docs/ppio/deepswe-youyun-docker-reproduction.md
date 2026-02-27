@@ -213,6 +213,20 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
 | `enforce_eager` | False | **True** | Avoids TMA error but slower |
 | `temperature` | 1.0 | **0.6** | Different exploration |
 
+### GRPO++ Components Breakdown
+
+"GRPO++" is a recipe name from the DeepSWE blog. Despite the "GRPO" prefix, the advantage estimator is actually RLOO — "GRPO" refers to the algorithm family lineage, not the specific estimator.
+
+| Component | Official Config | Our Config | Match? | Code Location |
+|-----------|----------------|------------|--------|---------------|
+| **RLOO Advantage** | `adv_estimator=rloo` | `adv_estimator=grpo` | **NO** | `verl/trainer/ppo/core_algos.py` — RLOO: leave-one-out baseline (unbiased); GRPO: group mean + std normalization |
+| **Clip High (DAPO)** | `clip_ratio_high=0.28` | `clip_ratio_high=0.28` | Yes | `core_algos.py` — `torch.clamp(ratio, 1-clip_low, 1+clip_high)`, asymmetric clip |
+| **No KL Loss** | `use_kl_loss=False` | `use_kl_loss=False` | Yes | `verl/workers/actor/dp_actor.py` — skips `policy_loss += kl_loss * kl_coef` |
+| **No Entropy Loss** | `entropy_coeff=0.0` | `entropy_coeff=0.0` | Yes | `dp_actor.py` — `policy_loss = pg_loss` (no entropy bonus) |
+| **Compact Filtering** | `mask_truncated_samples=False` | `mask_truncated_samples=False` | Yes | `rllm/trainer/verl/agent_ppo_trainer.py` — keeps all trajectories including truncated |
+
+4 of 5 components match. The only deviation: `adv_estimator` switched from `rloo` to `grpo` on Feb 12 afternoon, never reverted. Official ref: `examples/swe/train_deepswe_32b.sh`.
+
 ---
 
 ## 4. Architecture: Option B
