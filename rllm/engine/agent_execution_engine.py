@@ -431,69 +431,158 @@ class AgentExecutionEngine:
     def assemble_steps(self, steps: list[dict]):
         """
         Transform step-by-step results into trajectory format for training.
-        
-        Fixed version: Uses lenient token assembly that does not require
-        exact token match. This handles BPE retokenization differences.
-        
-        Key insight: completion_ids are always correct (model actual output).
-        We use them directly without verification against re-tokenized sequence.
-        For observation tokens, we take them from the current step prompt_ids
-        suffix (after the previous step end position).
+
+        Dispatches to text-based assembly (preferred) or legacy length-delta
+        fallback depending on whether text fields are available.
+
+        Returns:
+            (prompt_tokens, response_tokens, response_masks, is_valid_trajectory)
+            All tensors are torch.long. response_masks has 1 for completion
+            tokens (contribute to loss) and 0 for observation tokens.
         """
-        # Start with initial prompt from first step
+        if "prompt" in steps[0] and "response" in steps[0]:
+            try:
+                return self._assemble_steps_text_based(steps)
+            except Exception as e:
+                logger.warning(f"Text-based assembly failed ({e}), falling back to legacy")
+        return self._assemble_steps_legacy(steps)
+
+    def _assemble_steps_text_based(self, steps: list[dict]):
+        """
+        Text-based trajectory assembly using single retokenization.
+
+        Builds the full conversation text, tokenizes it once with
+        offset_mapping, then aligns completion masks by character spans.
+        This avoids BPE boundary issues that arise from splicing token
+        sequences from different tokenizations.
+        """
+        tokenizer = self.tokenizer
+        last_idx = len(steps) - 1
+
+        # --- Phase 1: build full_text and completion character spans ---------
+        # steps[-1]["prompt"] already contains the entire conversation up to
+        # the last generation.  Append the last completion (with special
+        # tokens, e.g. <|im_end|>) to get the complete trajectory text.
+        last_completion_text = tokenizer.decode(
+            steps[-1]["completion_ids"], skip_special_tokens=False
+        )
+        full_text = steps[-1]["prompt"] + last_completion_text
+
+        eot_token = getattr(self.chat_parser, "eot_token", "")
+
+        completion_char_spans = []
+        for i, step in enumerate(steps):
+            comp_start = len(step["prompt"])  # char offset where completion begins
+            comp_end_text = comp_start + len(step["response"])  # end of visible text
+
+            if i < last_idx and eot_token:
+                # Extend span to include <|im_end|>\n — the model generated the
+                # stop token, so it should be mask=1.
+                if full_text[comp_end_text: comp_end_text + len(eot_token)] == eot_token:
+                    comp_end = comp_end_text + len(eot_token)
+                else:
+                    comp_end = comp_end_text
+            else:
+                # Last step: completion extends to end of full_text
+                comp_end = len(full_text)
+
+            completion_char_spans.append((comp_start, comp_end))
+
+        # --- Phase 2: tokenize the full text once ----------------------------
+        encoding = tokenizer(
+            full_text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        full_ids = encoding["input_ids"]
+        offset_mapping = encoding["offset_mapping"]
+
+        # --- Phase 3: split into prompt / response at initial prompt boundary
+        initial_prompt_char_end = len(steps[0]["prompt"])
+
+        # Find the token index where the initial prompt ends.
+        # A token belongs to the prompt if its character span ends within the
+        # prompt region.
+        prompt_token_end = 0
+        for idx, (cs, ce) in enumerate(offset_mapping):
+            if ce <= initial_prompt_char_end:
+                prompt_token_end = idx + 1
+            else:
+                break
+
+        prompt_ids = full_ids[:prompt_token_end]
+        response_ids = full_ids[prompt_token_end:]
+        response_offsets = offset_mapping[prompt_token_end:]
+
+        # --- Phase 4: build response mask ------------------------------------
+        response_masks = []
+        for tok_start, tok_end in response_offsets:
+            is_completion = False
+            for comp_start, comp_end in completion_char_spans:
+                if tok_start >= comp_start and tok_end <= comp_end:
+                    is_completion = True
+                    break
+            response_masks.append(1 if is_completion else 0)
+
+        prompt_tokens = torch.tensor(prompt_ids, dtype=torch.long)
+        response_tokens = torch.tensor(response_ids, dtype=torch.long)
+        response_masks = torch.tensor(response_masks, dtype=torch.long)
+
+        assert len(response_masks) == len(response_tokens), (
+            f"Mask/token length mismatch: {len(response_masks)} vs {len(response_tokens)}"
+        )
+
+        return prompt_tokens, response_tokens, response_masks, True
+
+    def _assemble_steps_legacy(self, steps: list[dict]):
+        """
+        Legacy length-delta based trajectory assembly.
+
+        Uses token length differences to infer observation boundaries.
+        This can be inaccurate when BPE retokenization changes token counts
+        at completion/observation boundaries.
+        """
         initial_prompt_ids = steps[0]["prompt_ids"]
-        
+
         response_tokens = []
         response_masks = []
-        
-        # Track expected accumulated length for observation calculation
+
         prev_step_end_len = len(initial_prompt_ids)
-        
+
         for i, step in enumerate(steps):
             current_prompt_ids = step["prompt_ids"]
             current_completion_ids = step["completion_ids"]
-            
+
             if i == 0:
-                # First step: just add completion
                 response_tokens.extend(current_completion_ids)
                 response_masks.extend([1] * len(current_completion_ids))
                 prev_step_end_len = len(current_prompt_ids) + len(current_completion_ids)
             else:
-                # Calculate observation tokens (tokens added by environment)
-                # These are the tokens between the previous step end and current completion
                 current_prompt_len = len(current_prompt_ids)
-                
+
                 if current_prompt_len > prev_step_end_len:
-                    # There are observation tokens
-                    # Take them from current_prompt_ids (these are the re-tokenized version)
                     observation_len = current_prompt_len - prev_step_end_len
                     observation_tokens = current_prompt_ids[-observation_len:]
-                    
+
                     response_tokens.extend(observation_tokens)
-                    response_masks.extend([0] * len(observation_tokens))  # observation = mask 0
+                    response_masks.extend([0] * len(observation_tokens))
                 elif current_prompt_len < prev_step_end_len:
-                    # This should not happen - prompt should grow
-                    # Log warning but continue
                     logger.warning(
-                        f"Step {i}: prompt length ({current_prompt_len}) < previous end ({prev_step_end_len}). "
-                        f"This may indicate truncation or an error."
+                        f"Step {i}: prompt length ({current_prompt_len}) < previous end "
+                        f"({prev_step_end_len}). This may indicate truncation."
                     )
-                
-                # Add completion tokens (model output = mask 1)
+
                 response_tokens.extend(current_completion_ids)
                 response_masks.extend([1] * len(current_completion_ids))
-                
-                # Update for next iteration
+
                 prev_step_end_len = current_prompt_len + len(current_completion_ids)
-        
-        assert len(response_masks) == len(response_tokens), f"Mask/token length mismatch: {len(response_masks)} vs {len(response_tokens)}"
-        
+
+        assert len(response_masks) == len(response_tokens), (
+            f"Mask/token length mismatch: {len(response_masks)} vs {len(response_tokens)}"
+        )
+
         prompt_tokens = torch.tensor(initial_prompt_ids, dtype=torch.long)
         response_tokens = torch.tensor(response_tokens, dtype=torch.long)
         response_masks = torch.tensor(response_masks, dtype=torch.long)
-        
-        # Always return True since we do not do strict verification anymore
-        # The response_masks correctly identify completion regions
+
         return prompt_tokens, response_tokens, response_masks, True
 
 
