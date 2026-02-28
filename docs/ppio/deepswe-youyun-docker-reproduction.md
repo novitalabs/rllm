@@ -368,14 +368,6 @@ Most likely through PPIO hosting infrastructure (jumpserver SSH key or `admin@PP
 
 Evaluated using R2E-Gym native `edit.py` agent with `--nouse_fn_calling` flag, R2E-Gym scaffold, `max_steps_absolute=100`, Docker backend on youyun.37, vLLM TP=8.
 
-### Pilot Run (Feb 26, k=100, k8s backend)
-
-| Model | Samples | Resolved | Rate | llm_query_error | max_step_limit |
-|---|---|---|---|---|---|
-| DeepSWE-Preview | 101 | 33 | **32.7%** | 27 (26.7%) | 12 |
-| DeepSWE-Step198 | 99 | 31 | **31.3%** | 1 (1.0%) | 16 |
-| Qwen3-32B (baseline) | 99 | 19 | **19.2%** | 8 (8.1%) | 29 |
-
 ### Full Run (Feb 27, k=500, Docker backend on youyun.37)
 
 K8s pipeline failed (vLLM pod disappeared, 78% LLM errors). Switched to Docker backend on youyun.37 directly.
