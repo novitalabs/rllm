@@ -126,7 +126,7 @@ class AgentExecutionEngine:
         # Create a thread pool executor for environment interactions (i.e. step, reset, close)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    async def get_model_response(self, prompt, application_id, **kwargs) -> str:
+    async def get_model_response(self, prompt, application_id, prompt_token_ids=None, **kwargs) -> str:
         """
         Compute model response asynchronously based on the engine type.
 
@@ -136,6 +136,9 @@ class AgentExecutionEngine:
         Args:
             prompt: The input prompt to send to the model
             application_id: Unique identifier for the application
+            prompt_token_ids: Optional pre-tokenized prompt IDs to send directly to vLLM,
+                bypassing text re-encoding. Used to avoid BPE retokenization mismatches
+                in multi-step agent trajectories.
             **kwargs: Additional arguments to pass to the model
 
         Returns:
@@ -154,7 +157,7 @@ class AgentExecutionEngine:
         elif self.engine_name == "verl":
             meta_data = sampling_params.pop("meta_info", {})
             validate = meta_data.get("validate", False)
-            output = await self.rollout_engine.get_model_response(prompt, application_id=application_id, validate=validate, enforce_max_prompt_length=False, **sampling_params)
+            output = await self.rollout_engine.get_model_response(prompt, prompt_token_ids=prompt_token_ids, application_id=application_id, validate=validate, enforce_max_prompt_length=False, **sampling_params)
             return output
         elif self.engine_name == "tinker":
             output = await self.rollout_engine.get_model_response(prompt, application_id=application_id, enforce_max_prompt_length=False, **sampling_params)
@@ -215,10 +218,63 @@ class AgentExecutionEngine:
         messages = agent.chat_completions
         prompt_tokens, _ = convert_messages_to_tokens_and_masks(messages, tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=True, contains_generation_msg=True)
         prompt_token_len = len(prompt_tokens)
-        # Note, this should never happen!
+        # Handle overlong initial prompts gracefully (e.g. some SWE-bench tasks have long descriptions)
         if prompt_token_len > self.max_prompt_length:
+            colorful_print(f"Trajectory {idx}: initial prompt length {prompt_token_len} > max_prompt_length {self.max_prompt_length}, skipping with zero reward.", "red")
+            await loop.run_in_executor(self.executor, env.close)
             agent.reset()
-            raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
+            trajectory: Trajectory = agent.trajectory
+            if mode == "Text":
+                return trajectory
+            elif mode == "Token":
+                extra_info = getattr(env, "entry", None) or {}
+                if isinstance(extra_info, str):
+                    import json as _json
+                    try:
+                        extra_info = _json.loads(extra_info)
+                    except (ValueError, TypeError):
+                        extra_info = {}
+                # Return minimal valid result with a single dummy token and zero mask
+                pad_id = self.tokenizer.pad_token_id or 0
+                return {
+                    "prompt_tokens": torch.tensor(prompt_tokens[:self.max_prompt_length], dtype=torch.long),
+                    "response_tokens": torch.tensor([pad_id], dtype=torch.long),
+                    "response_masks": torch.tensor([0], dtype=torch.long),
+                    "trajectory_reward": 0.0,
+                    "idx": env.idx,
+                    "chat_completions": agent.chat_completions,
+                    "metrics": {
+                        "steps": 0,
+                        "reward_time": None,
+                        "env_time": 0.0,
+                        "llm_time": 0.0,
+                        "total_time": 0.0,
+                        "token_mismatch": 0.0,
+                        "termination_reason": "OVERLONG_PROMPT",
+                        "repo_name": extra_info.get("repo_name", ""),
+                        "instance_id": extra_info.get("commit_hash", extra_info.get("instance_id", "")),
+                    },
+                }
+            elif mode == "Conversation":
+                return agent.chat_completions
+            elif mode == "Step":
+                return {
+                    "steps": [],
+                    "trajectory_reward": 0.0,
+                    "idx": env.idx,
+                    "mc_returns": [],
+                    "termination_reason": "OVERLONG_PROMPT",
+                }
+            else:
+                raise ValueError(f"Mode {mode} not supported")
+
+        # Token accumulation state: avoid BPE retokenization mismatches across steps.
+        # After step 0, we accumulate exact token IDs and send them directly to vLLM,
+        # bypassing text re-encoding. This ensures assemble_steps() always validates.
+        accumulated_token_ids = None  # Populated after step 0 for verl engine
+        eot_tokens = None
+        if self.engine_name == "verl" and hasattr(self.chat_parser, "eot_token"):
+            eot_tokens = self.tokenizer.encode(self.chat_parser.eot_token, add_special_tokens=False)
 
         for step_idx in range(self.max_steps):
             # Get action from agent
@@ -240,11 +296,21 @@ class AgentExecutionEngine:
             kwargs["max_tokens"] = max_tokens
 
             start_time = time.time()
-            model_output = await self.get_model_response(prompt_messages, application_id, **kwargs)
+            model_output = await self.get_model_response(prompt_messages, application_id, prompt_token_ids=accumulated_token_ids, **kwargs)
             response = model_output.text
             delta_time = time.time() - start_time
             llm_time += delta_time
             total_time += delta_time
+
+            # Update accumulated token IDs from model output
+            if eot_tokens is not None:
+                if accumulated_token_ids is None:
+                    # Step 0: initialize from model output's actual prompt + completion
+                    accumulated_token_ids = list(model_output.prompt_ids) + list(model_output.completion_ids)
+                else:
+                    # Step 1+: vLLM saw our exact prefix, just append completion
+                    accumulated_token_ids = accumulated_token_ids + list(model_output.completion_ids)
+
             # Update steps
             prompt_response_pair = {
                 "prompt": self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True),
@@ -353,6 +419,10 @@ class AgentExecutionEngine:
             response_tokens.extend(env_msg_tokens)
             response_masks.extend(env_msg_masks)
 
+            # Accumulate eot + env tokens for the next step's prompt
+            if accumulated_token_ids is not None and eot_tokens is not None and env_msg_tokens:
+                accumulated_token_ids = accumulated_token_ids + eot_tokens + list(env_msg_tokens)
+
             if step_idx == self.max_steps - 1:
                 termination_reason = "MAX_STEPS"
 
@@ -392,6 +462,15 @@ class AgentExecutionEngine:
             return trajectory
         elif mode == "Token":
             prompt_tokens, response_tokens, response_masks, is_valid_trajectory = self.assemble_steps(episode_steps)
+            # Extract task identifier from environment entry if available
+            extra_info = getattr(env, "entry", None) or {}
+            if isinstance(extra_info, str):
+                import json as _json
+                try:
+                    extra_info = _json.loads(extra_info)
+                except (ValueError, TypeError):
+                    extra_info = {}
+
             token_result = {
                 "prompt_tokens": prompt_tokens,
                 "response_tokens": response_tokens,
@@ -411,6 +490,10 @@ class AgentExecutionEngine:
                     # Total time spent in the trajectory
                     "total_time": total_time,
                     "token_mismatch": 0.0 if is_valid_trajectory else 1.0,
+                    # Per-trajectory identifiers (not aggregated, used for detailed logging)
+                    "termination_reason": termination_reason,
+                    "repo_name": extra_info.get("repo_name", ""),
+                    "instance_id": extra_info.get("commit_hash", extra_info.get("instance_id", "")),
                 },
             }
             return token_result
@@ -507,14 +590,42 @@ class AgentExecutionEngine:
             timing_raw = {}
         assert all(env is not None and isinstance(env, BaseEnv) for env in self.envs), "All environments must be inheriting from BaseEnv"
         assert all(env.is_multithread_safe() for env in self.envs), "All environments must be multithread safe for async engine"  # type: ignore
-        max_concurrency = self.n_parallel_agents
+        # Use actual env count for concurrency (allows validation to run all samples in parallel)
+        max_concurrency = len(self.envs)
 
-        self.executor = ThreadPoolExecutor(max_workers=max_concurrency)
+        self.executor = ThreadPoolExecutor(max_workers=min(max_concurrency, 256))
 
         if self.engine_name == "verl":
             await self.rollout_engine.wake_up()  # type: ignore
 
-        semaphore = asyncio.Semaphore(self.n_parallel_agents)
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        def _make_dummy_token_result(env_idx: int):
+            """Create a minimal valid token result for a failed trajectory."""
+            env = self.envs[env_idx]
+            pad_id = self.tokenizer.pad_token_id or 0
+            extra_info = getattr(env, "entry", None) or {}
+            if isinstance(extra_info, str):
+                import json as _json
+                try:
+                    extra_info = _json.loads(extra_info)
+                except (ValueError, TypeError):
+                    extra_info = {}
+            return {
+                "prompt_tokens": torch.tensor([pad_id], dtype=torch.long),
+                "response_tokens": torch.tensor([pad_id], dtype=torch.long),
+                "response_masks": torch.tensor([0], dtype=torch.long),
+                "trajectory_reward": 0.0,
+                "idx": env.idx,
+                "chat_completions": [],
+                "metrics": {
+                    "steps": 0, "reward_time": None, "env_time": 0.0,
+                    "llm_time": 0.0, "total_time": 0.0, "token_mismatch": 0.0,
+                    "termination_reason": "ERROR",
+                    "repo_name": extra_info.get("repo_name", ""),
+                    "instance_id": extra_info.get("commit_hash", extra_info.get("instance_id", "")),
+                },
+            }
 
         async def launch_one_trajectory_task(env_idx: int):
             async with semaphore:
@@ -527,9 +638,12 @@ class AgentExecutionEngine:
                     )
                 except Exception as e:
                     import traceback
-
                     traceback.print_exc()
-                    raise e
+                    colorful_print(f"Trajectory {env_idx} failed, returning dummy result: {e}", "red")
+                    if mode == "Token":
+                        return _make_dummy_token_result(env_idx)
+                    else:
+                        raise e
                 return result
 
         # Create all N conceptual tasks. Their execution will be throttled by the semaphore
@@ -538,13 +652,10 @@ class AgentExecutionEngine:
 
         tasks_completed = 0
         for coro in asyncio.as_completed(tasks_to_run):
-            try:
-                result = await coro
-                tasks_completed += 1
-                colorful_print(f"Number of Trajectories {tasks_completed}/{len(self.envs)} completed", "cyan")
-                yield result
-            except Exception as e:
-                raise e
+            result = await coro
+            tasks_completed += 1
+            colorful_print(f"Number of Trajectories {tasks_completed}/{len(self.envs)} completed", "cyan")
+            yield result
 
         if self.engine_name == "verl":
             await self.rollout_engine.sleep()  # type: ignore

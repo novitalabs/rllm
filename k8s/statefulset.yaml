@@ -1,0 +1,144 @@
+# DeepSWE 32B Training — StatefulSet + Headless Service
+# 4 pods (1 head + 3 workers), each with 8x H200 GPUs + DinD
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepswe-training-headless
+  namespace: deepswe
+  labels:
+    app: deepswe-training
+spec:
+  clusterIP: None
+  selector:
+    app: deepswe-training
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: ray-dashboard
+      port: 8265
+      targetPort: 8265
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: deepswe-training
+  namespace: deepswe
+  labels:
+    app: deepswe-training
+spec:
+  serviceName: deepswe-training-headless
+  replicas: 4
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: deepswe-training
+  template:
+    metadata:
+      labels:
+        app: deepswe-training
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        deepswe-training: "true"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - deepswe-training
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: training
+          image: docker.io/library/rllm-deepswe:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/workspace/rllm/k8s/scripts/entrypoint.sh"]
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: "120"
+              memory: "1400Gi"
+              nvidia.com/gpu: "8"
+            limits:
+              nvidia.com/gpu: "8"
+          env:
+            - name: HEAD_SVC_NAME
+              value: deepswe-training-headless
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PREWARM_IMAGES
+              value: "false"  # Set to "true" on first deployment
+            - name: DOCKERHUB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: dockerhub-creds
+                  key: username
+                  optional: true
+            - name: DOCKERHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dockerhub-creds
+                  key: token
+                  optional: true
+          volumeMounts:
+            - name: docker-data
+              mountPath: /var/lib/docker
+            - name: rllm-source
+              mountPath: /workspace/rllm
+            - name: model-weights
+              mountPath: /data/models
+              readOnly: true
+            - name: checkpoints
+              mountPath: /workspace/checkpoints
+            - name: dshm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+      volumes:
+        - name: rllm-source
+          hostPath:
+            path: /root/develop/ref/rllm
+            type: Directory
+        - name: model-weights
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: checkpoints
+          hostPath:
+            path: /data/checkpoints/deepswe
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+  volumeClaimTemplates:
+    - metadata:
+        name: docker-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-storage
+        resources:
+          requests:
+            storage: 200Gi

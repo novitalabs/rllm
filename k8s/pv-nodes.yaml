@@ -1,0 +1,99 @@
+# PersistentVolumes for DinD Docker image cache — one per node.
+# Local path: /data/docker-cache (must be pre-created on each node)
+# Size: 200Gi per node (10 base repos ~15GB + runtime overhead)
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-node-0
+  labels:
+    app: deepswe-training
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - node-0  # 10.83.115.18 — replace with actual K8s node name
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-node-1
+  labels:
+    app: deepswe-training
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - node-1  # 10.83.115.21 — replace with actual K8s node name
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-node-2
+  labels:
+    app: deepswe-training
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - node-2  # 10.83.115.22 — replace with actual K8s node name
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-node-3
+  labels:
+    app: deepswe-training
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - node-3  # 10.83.115.23 — replace with actual K8s node name

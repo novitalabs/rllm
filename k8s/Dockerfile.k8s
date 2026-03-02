@@ -1,0 +1,83 @@
+FROM vllm/vllm-openai:v0.10.2
+
+# =============================================================================
+# DeepSWE K8s Training Image (DinD + GPU Training)
+# Base: vllm/vllm-openai:v0.10.2 (includes torch, cuda, vllm 0.10.2)
+#
+# rllm source is mounted at runtime via hostPath, not baked into image.
+# DinD (Docker-in-Docker) for R2E-Gym SWE task containers.
+#
+# Build (from rllm repo root):
+#   docker build --network=host \
+#     --build-arg http_proxy=http://127.0.0.1:1083 \
+#     --build-arg https_proxy=http://127.0.0.1:1083 \
+#     -t rllm-deepswe:latest -f k8s/Dockerfile.k8s .
+# =============================================================================
+
+# Override vllm's default entrypoint (api_server)
+ENTRYPOINT ["/bin/bash"]
+
+# ---------- System deps + Docker CE for DinD ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git wget curl vim htop rsync openssh-client \
+        ca-certificates gnupg lsb-release iptables kmod procps iproute2 && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+        gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------- Python deps ----------
+# verl (RL training framework)
+RUN pip install --no-cache-dir "verl==0.6.1" "verl[vllm]"
+
+# Ray for multi-node cluster
+RUN pip install --no-cache-dir "ray[default]>=2.40"
+
+# R2E-Gym (SWE-Bench environment)
+RUN pip install --no-cache-dir --ignore-installed blinker && \
+    pip install --no-cache-dir git+https://github.com/agentica-project/R2E-Gym
+
+# PPIO Sandbox SDK
+RUN pip install --no-cache-dir ppio_sandbox
+
+# rllm core dependencies + swe extras (rllm itself mounted at runtime)
+RUN pip install --no-cache-dir \
+    transformers>=4.55.0 \
+    datasets>=2.20.0 \
+    pandas polars pillow numpy sympy \
+    pylatexenc "antlr4-python3-runtime==4.9.3" \
+    mcp eval-protocol \
+    hydra-core openai fastapi uvicorn \
+    tqdm PyYAML pydantic wrapt "asgiref>=3.7.0" wandb \
+    docker kubernetes swebench
+
+# Flash Attention 2 (required for FSDP training with Qwen3)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation && \
+    pip install --no-cache-dir "numpy<2.3"
+
+# Playwright (for web-based agent tasks)
+RUN pip install --no-cache-dir playwright && \
+    playwright install chromium && \
+    playwright install-deps
+
+# ---------- Env defaults ----------
+ENV NCCL_CUMEM_ENABLE=0
+ENV NCCL_DEBUG=WARN
+ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+ENV VLLM_USE_V1=1
+ENV VLLM_ATTENTION_BACKEND=FLASH_ATTN
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+
+# ---------- Entrypoint + helper scripts ----------
+COPY k8s/scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY k8s/scripts/prewarm-images.py /usr/local/bin/prewarm-images.py
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

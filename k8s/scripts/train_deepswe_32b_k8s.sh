@@ -1,29 +1,12 @@
 set -x
 
-# Fix CUBLAS version mismatch: pip cublas (12.8) vs system cublas (12.9)
-export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH:-}
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
-export VLLM_USE_V1=1
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
-
-# NCCL RDMA configuration (8x 400G RoCE v2 NICs, 1:1 GPU-NIC PIX mapping)
-export NCCL_IB_DISABLE=0
-export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_11
-export NCCL_IB_GID_INDEX=3
-export NCCL_NET_GDR_LEVEL=5
-export NCCL_SOCKET_IFNAME=b_manage0
-export NCCL_DEBUG=INFO
-
-# Find the directory where rllm package is located
-RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
+# Environment is set by entrypoint.sh (PYTHONPATH, VLLM_*, NCCL_*)
 
 python3 -m rllm.trainer.verl.train_agent_ppo \
     algorithm.adv_estimator=rloo \
-    data.train_files=/root/develop/ref/rllm/data/swe/R2E_Gym_Subset.parquet \
-    data.val_files=/root/develop/ref/rllm/data/swe/SWE_Bench_Verified.parquet \
-    data.train_batch_size=8 \
+    data.train_files=/workspace/rllm/data/swe/R2E_Gym_Subset.parquet \
+    data.val_files=/workspace/rllm/data/swe/SWE_Bench_Verified.parquet \
+    data.train_batch_size=32 \
     data.val_batch_size=512 \
     data.max_prompt_length=4096 \
     data.max_response_length=32768 \
@@ -68,7 +51,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.experiment_name='swe-agent-rl' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
-    trainer.nnodes=8 \
+    trainer.nnodes=4 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.default_hdfs_dir=null \

@@ -24,6 +24,8 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.utils import Role, WorkerType
+
+from rllm.utils import colorful_print
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
@@ -426,15 +428,16 @@ class AgentPPOTrainer(RayPPOTrainer):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    # save checkpoint before validation so a validation crash doesn't lose training progress
+                    if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                        with marked_timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
                         with marked_timer("testing", timing_raw):
                             val_metrics: dict = self._validate_agent()
                         metrics.update(val_metrics)
-
-                    if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
-                        with marked_timer("save_checkpoint", timing_raw):
-                            self._save_checkpoint()
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
@@ -607,22 +610,29 @@ class AgentPPOTrainer(RayPPOTrainer):
         traj_metrics = []
         metrics = {}
 
+        skipped = 0
         for traj in trajectories:
             prompt_tokens = traj["prompt_tokens"]
             response_tokens = traj["response_tokens"]
-            # test if trajectory is empty
-            assert prompt_tokens.numel() != 0 and response_tokens.numel() != 0, f"Both prompt {prompt_tokens.numel()} and response {response_tokens.numel()} of trajectory shouldn't be empty. Please check make sure environment is working and the config"
+            # Skip trajectories with empty prompts or responses (e.g. overlong initial prompts)
+            if prompt_tokens.numel() == 0 or response_tokens.numel() == 0:
+                skipped += 1
+                continue
             all_initial_tokens_list.append(prompt_tokens)
             all_response_tokens_list.append(response_tokens)
             all_masks_list.append(traj["response_masks"])
             traj_scores.append(traj["trajectory_reward"])
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
+        if skipped > 0:
+            colorful_print(f"Skipped {skipped}/{len(trajectories)} trajectories with empty prompt/response (e.g. overlong initial prompts)", "red")
 
         # Flatten traj_metrics into a dict of lists
-        traj_metrics = {k: [d[k] for d in traj_metrics] for k in traj_metrics[0]}
-        # Aggregate metrics (mean, min, max)
-        for k, v_list in traj_metrics.items():
+        traj_metrics_flat = {k: [d[k] for d in traj_metrics] for k in traj_metrics[0]}
+        # Aggregate numeric metrics (mean, min, max); skip string fields
+        for k, v_list in traj_metrics_flat.items():
+            if v_list and isinstance(v_list[0], str):
+                continue  # skip non-numeric fields like repo_name, instance_id, termination_reason
             v_list = [v for v in v_list if v is not None and v >= 0]
             if not v_list:
                 continue
@@ -635,9 +645,29 @@ class AgentPPOTrainer(RayPPOTrainer):
                 }
             )
 
-        # Save chat completions to a file
+        # Save per-trajectory detail log (JSONL) for traceability
         save_dir = os.path.join(self.config.trainer.default_local_dir, "chat_completions")
         os.makedirs(save_dir, exist_ok=True)
+
+        traj_log_dir = os.path.join(self.config.trainer.default_local_dir, "traj_logs")
+        os.makedirs(traj_log_dir, exist_ok=True)
+        with open(os.path.join(traj_log_dir, f"{self.global_steps}.jsonl"), "w") as f:
+            for m in traj_metrics:
+                f.write(json.dumps(m) + "\n")
+
+        # Log top-5 slowest trajectories for this step
+        sorted_by_time = sorted(enumerate(traj_metrics), key=lambda x: x[1].get("total_time", 0), reverse=True)
+        tail_lines = []
+        for rank, (i, m) in enumerate(sorted_by_time[:5]):
+            tail_lines.append(
+                f"  #{rank+1} traj={i} repo={m.get('repo_name','')} "
+                f"steps={m.get('steps',0)} total={m.get('total_time',0):.0f}s "
+                f"llm={m.get('llm_time',0):.0f}s env={m.get('env_time',0):.0f}s "
+                f"reason={m.get('termination_reason','')} "
+                f"instance={m.get('instance_id','')[:16]}"
+            )
+        colorful_print(f"Top-5 slowest trajectories (step {self.global_steps}):\n" + "\n".join(tail_lines), "cyan")
+
         # Save it into a jsonl files (self.global_steps)
         with open(os.path.join(save_dir, f"{self.global_steps}.jsonl"), "w") as f:
             for chat_completion in chat_completions:
