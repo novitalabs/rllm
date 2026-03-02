@@ -83,6 +83,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: REGISTRY_MIRROR
+              value: "http://10.83.115.18:5000"  # Local pull-through cache
             - name: PREWARM_IMAGES
               value: "false"  # Set to "true" on first deployment
             - name: DOCKERHUB_USERNAME

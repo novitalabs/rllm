@@ -75,7 +75,22 @@ export HTTPS_PROXY=http://127.0.0.1:1083
 export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8
 echo "[phase-1] Docker proxy configured: ${HTTPS_PROXY}"
 
-dockerd --storage-driver=overlay2 --host=unix:///var/run/docker.sock &
+# Configure registry mirror (pull-through cache) and storage driver via daemon.json
+REGISTRY_MIRROR="${REGISTRY_MIRROR:-}"
+mkdir -p /etc/docker
+if [ -n "${REGISTRY_MIRROR}" ]; then
+    cat > /etc/docker/daemon.json <<DEOF
+{
+    "storage-driver": "overlay2",
+    "registry-mirrors": ["${REGISTRY_MIRROR}"],
+    "insecure-registries": ["${REGISTRY_MIRROR#http://}"]
+}
+DEOF
+    echo "[phase-1] Registry mirror configured: ${REGISTRY_MIRROR}"
+    dockerd --host=unix:///var/run/docker.sock &
+else
+    dockerd --storage-driver=overlay2 --host=unix:///var/run/docker.sock &
+fi
 DOCKERD_PID=$!
 
 # Poll until dockerd is ready (up to 60s)

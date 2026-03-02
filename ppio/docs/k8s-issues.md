@@ -301,7 +301,9 @@ Docker Hub → 429 Too Many Requests (on /images/create)
 
 **Impact**: 404 trajectories returned dummy results across 3 steps. Steps 7-9 contributed minimal effective gradient. ~3 wasted training steps (~4h, 128 GPU-hours).
 
-**Fix**: Deploy a local Docker registry mirror (pull-through cache) on the cluster to cache r2e-gym images. See `k8s/registry/` for deployment files.
+**Fix**: Deployed a local Docker registry mirror (pull-through cache) on 10.83.115.18:5000 to cache r2e-gym images. All DinD daemons configured to use it as `registry-mirrors`. On cache hit, images are served from LAN (~1-3s); on cache miss, only the registry's IP counts against Docker Hub rate limit.
+
+**Files**: `k8s/registry/config.yml`, `k8s/registry/docker-registry-mirror.service`, `k8s/registry/setup.sh`, `k8s/scripts/entrypoint.sh` (daemon.json with registry-mirrors), `k8s/statefulset.yaml` (REGISTRY_MIRROR env var)
 
 **Note**: This issue does NOT affect `batch_size=8` (64 trajectories/step) because the pull rate stays within Docker Hub's limit.
 
@@ -327,6 +329,7 @@ Based on all issues encountered, here's the checklist for deploying DeepSWE trai
 - [x] `GLOO_SOCKET_IFNAME=b_manage0` (FSDP Gloo backend) — Issue 6
 - [x] `NCCL_CUMEM_ENABLE=0` (disable NVLS transport) — Issue 7
 - [x] `HTTP_PROXY`/`HTTPS_PROXY` before `dockerd` start — Issue 5
+- [x] Registry mirror (`REGISTRY_MIRROR` env, daemon.json) — Issue 11
 
 ### Software Patches
 - [x] verl `extra_info` JSON deserialization patch — Issue 1

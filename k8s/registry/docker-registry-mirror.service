@@ -1,0 +1,23 @@
+[Unit]
+Description=Docker Hub Pull-Through Cache (Registry Mirror)
+After=docker.service
+Requires=docker.service
+
+[Service]
+TimeoutStartSec=0
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker stop registry-mirror
+ExecStartPre=-/usr/bin/docker rm registry-mirror
+ExecStart=/usr/bin/docker run --rm --name registry-mirror \
+    -v /data/registry-cache/data:/var/lib/registry \
+    -v /data/registry-cache/config.yml:/etc/docker/registry/config.yml:ro \
+    -e HTTP_PROXY=http://127.0.0.1:1083 \
+    -e HTTPS_PROXY=http://127.0.0.1:1083 \
+    -e NO_PROXY=localhost,127.0.0.1,10.0.0.0/8 \
+    --network=host \
+    registry:2
+ExecStop=/usr/bin/docker stop registry-mirror
+
+[Install]
+WantedBy=multi-user.target
