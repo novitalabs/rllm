@@ -1,5 +1,5 @@
 # DeepSWE 32B Training — StatefulSet + Headless Service
-# 4 pods (1 head + 3 workers), each with 8x H200 GPUs + DinD
+# 2 pods (1 head + 1 worker), each with 8x H200 GPUs + DinD
 ---
 apiVersion: v1
 kind: Service
@@ -29,7 +29,7 @@ metadata:
     app: deepswe-training
 spec:
   serviceName: deepswe-training-headless
-  replicas: 4
+  replicas: 2
   podManagementPolicy: OrderedReady
   selector:
     matchLabels:
@@ -84,7 +84,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: REGISTRY_MIRROR
-              value: "http://10.83.115.18:5000"  # Local pull-through cache
+              value: "http://10.83.115.14:5000"  # Local pull-through cache
             - name: PREWARM_IMAGES
               value: "false"  # Set to "true" on first deployment
             - name: DOCKERHUB_USERNAME

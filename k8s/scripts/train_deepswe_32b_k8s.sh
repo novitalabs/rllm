@@ -6,7 +6,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     algorithm.adv_estimator=rloo \
     data.train_files=/workspace/rllm/data/swe/R2E_Gym_Subset.parquet \
     data.val_files=/workspace/rllm/data/swe/SWE_Bench_Verified.parquet \
-    data.train_batch_size=32 \
+    data.train_batch_size=16 \
     data.val_batch_size=512 \
     data.max_prompt_length=4096 \
     data.max_response_length=32768 \
@@ -51,7 +51,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.experiment_name='swe-agent-rl' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
-    trainer.nnodes=4 \
+    trainer.nnodes=2 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.default_hdfs_dir=null \

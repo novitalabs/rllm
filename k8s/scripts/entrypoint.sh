@@ -163,7 +163,7 @@ fi
 if [ "$ORDINAL" = "0" ]; then
     echo "[phase-3] Head node: waiting for all Ray nodes..."
 
-    EXPECTED_NODES=4
+    EXPECTED_NODES=2
     for i in $(seq 1 300); do
         ACTIVE_NODES=$(python3 -c "
 import ray
