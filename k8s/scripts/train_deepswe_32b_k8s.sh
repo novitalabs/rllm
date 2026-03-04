@@ -57,6 +57,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.default_hdfs_dir=null \
     rllm.env.name=swe \
     +rllm.env.env_args.backend=docker \
+    +rllm.env.env_args.delete_image=True \
     rllm.agent.name=sweagent \
     rllm.agent.max_steps=30 \
     rllm.agent.overlong_filter=True \

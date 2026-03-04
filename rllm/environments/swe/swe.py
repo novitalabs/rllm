@@ -155,9 +155,15 @@ class SWEEnv(BaseEnv):
         if self.env is not None:
             self.env.close()
 
-        if self.delete_image:
-            docker_image = self.env.runtime.docker_image
-            os.system(f"docker rmi {docker_image}")
+        if self.delete_image and self.env is not None:
+            try:
+                docker_image = self.env.runtime.docker_image
+                # Attempt to remove image. Silently fails if other containers still
+                # reference it (concurrent rollouts sharing the same image). The last
+                # rollout to finish will successfully remove it.
+                os.system(f"docker rmi {docker_image} > /dev/null 2>&1")
+            except Exception:
+                pass
 
     @staticmethod
     def from_dict(extra_info: dict | str) -> "SWEEnv":

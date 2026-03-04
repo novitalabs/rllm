@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import math
 import os
+import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
@@ -125,6 +127,48 @@ class AgentPPOTrainer(RayPPOTrainer):
         self.agent_execution_engine.update_envs_and_agents(envs, agents)
         return envs
 
+    @staticmethod
+    def _extract_docker_images(batch_dict):
+        """Extract unique docker image names from a raw dataloader batch."""
+        extra_infos = batch_dict.get("extra_info", [])
+        images = set()
+        for info in extra_infos:
+            try:
+                if isinstance(info, str):
+                    info = json.loads(info)
+                if isinstance(info, dict) and "docker_image" in info:
+                    images.add(info["docker_image"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return images
+
+    def _prefetch_docker_images(self, batch_dict):
+        """Start pulling docker images for a batch in background threads.
+
+        Returns a ThreadPoolExecutor that can be shut down to cancel.
+        Pulling from local registry is fast (~5-10s/image), so prefetching
+        the next step's images during the current step's collect_trajectory
+        or update_actor eliminates cold-pull latency.
+        """
+        images = self._extract_docker_images(batch_dict)
+        if not images:
+            return None
+
+        def _pull(img):
+            try:
+                subprocess.run(
+                    ["docker", "pull", img],
+                    capture_output=True, timeout=300,
+                )
+            except Exception:
+                pass
+
+        executor = ThreadPoolExecutor(max_workers=min(16, len(images)))
+        for img in images:
+            executor.submit(_pull, img)
+        logging.getLogger(__name__).info(f"[prefetch] Started pulling {len(images)} docker images for next step")
+        return executor
+
     def fit_agent(self):
         """
         The training loop of PPO. Adapted to train the underlying model of agent.
@@ -159,7 +203,30 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
-            for batch_dict in self.train_dataloader:
+            # Use explicit iterator to enable one-step-ahead prefetching
+            batch_iter = iter(self.train_dataloader)
+            next_batch_dict = None
+            prefetch_executor = None
+
+            while True:
+                # Use prefetched batch if available, otherwise fetch fresh
+                if next_batch_dict is not None:
+                    batch_dict = next_batch_dict
+                    next_batch_dict = None
+                else:
+                    batch_dict = next(batch_iter, None)
+                    if batch_dict is None:
+                        break
+
+                # Prefetch: pull docker images for the NEXT batch while
+                # processing the current one. Peak DinD cache = ~2 steps
+                # of images (~42GB), well within budget.
+                if prefetch_executor is not None:
+                    prefetch_executor.shutdown(wait=False)
+                    prefetch_executor = None
+                next_batch_dict = next(batch_iter, None)
+                if next_batch_dict is not None:
+                    prefetch_executor = self._prefetch_docker_images(next_batch_dict)
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 batch = batch.repeat(
