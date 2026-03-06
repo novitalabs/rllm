@@ -15,7 +15,8 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
 # NCCL RDMA configuration (8x 400G RoCE v2 NICs, 1:1 GPU-NIC PIX mapping)
-export NCCL_CUMEM_ENABLE=0  # Disable NVLS transport (avoids 'Cuda failure 1' warnings)
+export NCCL_CUMEM_ENABLE=0  # Disable cuMem (avoids NVLS allocation issues)
+export NCCL_NVLS_ENABLE=0   # Disable NVLS transport explicitly (fixes OOM/invalid arg errors on some nodes)
 export NCCL_IB_DISABLE=0
 export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_11
 export NCCL_IB_GID_INDEX=3
@@ -143,7 +144,9 @@ if [ "$ORDINAL" = "0" ]; then
     echo "[phase-2] Ray head started on port ${RAY_PORT}"
 else
     # Worker node: resolve head pod's IP via headless service
-    HEAD_HOST="deepswe-training-0.${HEAD_SVC}.${POD_NS}.svc.cluster.local"
+    # Derive head pod name from current pod name (e.g., deepswe-30b-1 -> deepswe-30b-0)
+    POD_PREFIX="${MY_POD_NAME%-*}"  # Remove ordinal suffix
+    HEAD_HOST="${POD_PREFIX}-0.${HEAD_SVC}.${POD_NS}.svc.cluster.local"
 
     echo "[phase-2] Waiting for Ray head at ${HEAD_HOST}:${RAY_PORT}..."
     for i in $(seq 1 120); do
@@ -190,7 +193,9 @@ ray.shutdown()
 
     echo "[phase-3] Launching training..."
     ray status
-    bash /workspace/rllm/k8s/scripts/train_deepswe_32b_k8s.sh || true
+    # Training script can be passed as first argument or via TRAIN_SCRIPT env var
+    TRAIN_SCRIPT="${1:-${TRAIN_SCRIPT:-train_deepswe_32b_k8s.sh}}"
+    bash /workspace/rllm/k8s/scripts/${TRAIN_SCRIPT} || true
 
     echo "[phase-3] Training script exited, keeping pod alive for debugging"
     # Keep pod alive so we can inspect logs / re-run manually

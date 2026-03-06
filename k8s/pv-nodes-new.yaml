@@ -1,0 +1,97 @@
+# PersistentVolumes for new nodes (.18, .21, .22, .23)
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-30b-0
+  labels:
+    app: deepswe-30b
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - host-10-83-115-18
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-30b-1
+  labels:
+    app: deepswe-30b
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - host-10-83-115-21
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-235b-0
+  labels:
+    app: deepswe-235b
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - host-10-83-115-22
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: docker-cache-235b-1
+  labels:
+    app: deepswe-235b
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /data/docker-cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - host-10-83-115-23

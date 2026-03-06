@@ -1,0 +1,147 @@
+# DeepSWE 235B MoE Training — StatefulSet + Headless Service
+# 2 pods on .22 + .23, each with 8x H200 GPUs + DinD
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepswe-235b-headless
+  namespace: deepswe
+  labels:
+    app: deepswe-235b
+spec:
+  clusterIP: None
+  selector:
+    app: deepswe-235b
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: ray-dashboard
+      port: 8265
+      targetPort: 8265
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: deepswe-235b
+  namespace: deepswe
+  labels:
+    app: deepswe-235b
+spec:
+  serviceName: deepswe-235b-headless
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: deepswe-235b
+  template:
+    metadata:
+      labels:
+        app: deepswe-235b
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        deepswe-235b: "true"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - deepswe-235b
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: training
+          image: docker.io/library/rllm-deepswe:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/workspace/rllm/k8s/scripts/entrypoint.sh"]
+          args: ["train_deepswe_235b_moe.sh"]
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: "120"
+              memory: "1400Gi"
+              nvidia.com/gpu: "8"
+            limits:
+              nvidia.com/gpu: "8"
+          env:
+            - name: HEAD_SVC_NAME
+              value: deepswe-235b-headless
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REGISTRY_MIRROR
+              value: "http://10.83.115.14:5000"
+            - name: PREWARM_IMAGES
+              value: "false"
+            - name: DOCKERHUB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: dockerhub-creds
+                  key: username
+                  optional: true
+            - name: DOCKERHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dockerhub-creds
+                  key: token
+                  optional: true
+          volumeMounts:
+            - name: docker-data
+              mountPath: /var/lib/docker
+            - name: rllm-source
+              mountPath: /workspace/rllm
+            - name: model-weights
+              mountPath: /data/models
+              readOnly: true
+            - name: checkpoints
+              mountPath: /workspace/checkpoints
+            - name: dshm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+      volumes:
+        - name: rllm-source
+          hostPath:
+            path: /root/develop/ref/rllm
+            type: Directory
+        - name: model-weights
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: checkpoints
+          hostPath:
+            path: /data/checkpoints/deepswe-235b
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+  volumeClaimTemplates:
+    - metadata:
+        name: docker-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-storage
+        resources:
+          requests:
+            storage: 200Gi

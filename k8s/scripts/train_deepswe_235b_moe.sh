@@ -1,28 +1,29 @@
 set -x
 
-# Environment is set by entrypoint.sh (PYTHONPATH, VLLM_*, NCCL_*)
+# DeepSWE training with Qwen3-235B-A22B (MoE: 235B total, 22B active)
+# Runs on 2 nodes (16x H200): 10.83.115.22, 10.83.115.23
 
 python3 -m rllm.trainer.verl.train_agent_ppo \
     algorithm.adv_estimator=rloo \
     data.train_files=/workspace/rllm/data/swe/R2E_Gym_Subset.parquet \
     data.val_files=/workspace/rllm/data/swe/SWE_Bench_Verified.parquet \
-    data.train_batch_size=16 \
-    data.val_batch_size=512 \
+    data.train_batch_size=8 \
+    data.val_batch_size=256 \
     data.max_prompt_length=4096 \
     data.max_response_length=32768 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=32 \
-    actor_rollout_ref.model.path=/data/models/Qwen3-32B \
+    actor_rollout_ref.model.path=/data/models/Qwen3-235B-A22B \
     actor_rollout_ref.hybrid_engine=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum \
-    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32000 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16000 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -37,8 +38,8 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -48,7 +49,7 @@ python3 -m rllm.trainer.verl.train_agent_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='deepscaler-agent' \
-    trainer.experiment_name='swe-agent-rl-qwen3-32b' \
+    trainer.experiment_name='swe-agent-rl-qwen3-235b-moe' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=2 \
