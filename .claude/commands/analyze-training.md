@@ -70,6 +70,30 @@ python3 ppio/scripts/extract_llm_metrics.py /tmp/deepswe_raw.log
 python3 ppio/scripts/analyze_long_tail.py /tmp/deepswe_raw.log
 ```
 
+### 6. Plot training metrics
+
+```bash
+# From JSON (recommended):
+python3 ppio/scripts/parse_training_metrics.py --json /tmp/deepswe_raw.log > /tmp/metrics.json
+python3 ppio/scripts/plot_training_metrics.py /tmp/metrics.json -o /tmp/training_metrics.png
+
+# From raw log directly:
+python3 ppio/scripts/plot_training_metrics.py /tmp/deepswe_raw.log -o /tmp/training_metrics.png
+
+# Pipeline (one command):
+./ppio/scripts/fetch_k8s_metrics.sh | python3 ppio/scripts/parse_training_metrics.py --json - | python3 ppio/scripts/plot_training_metrics.py - -o /tmp/training_metrics.png
+```
+
+Options:
+- `-o FILE` — output PNG path (default: `training_metrics.png`)
+- `--steps N-M` — filter step range (e.g., `61-343`, `100-`)
+- `--no-smooth` — disable rolling average overlay
+- `--dpi N` — output DPI (default: 150)
+- `--title TEXT` — override figure title
+- `--window N` — rolling average window size (default: 10)
+
+Produces a 4x2 figure with: Score + Val Score, Entropy, PG Loss, Grad Norm, KL Divergence, Response Length, PPO Clip Fraction, R1 Rate.
+
 ## Reference Documentation
 
 - Overall analysis: `ppio/docs/training-timing-analysis.md`
