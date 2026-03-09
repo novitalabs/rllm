@@ -45,6 +45,9 @@ if [ -d /workspace/rllm ]; then
     echo "[setup] Added /workspace/rllm to PYTHONPATH"
 fi
 
+# ---------- Patch verl optimizer for megatron-core 0.16 API ----------
+python3 /workspace/rllm/k8s/scripts/patch_optimizer.py
+
 # ---------- Patch verl to handle JSON string extra_info ----------
 # verl's RLHFDataset.__getitem__ calls .get() on extra_info expecting a dict,
 # but our parquet stores it as a JSON string. Patch in-place at startup.

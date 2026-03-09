@@ -17,6 +17,10 @@ FROM vllm/vllm-openai:v0.10.2
 # Override vllm's default entrypoint (api_server)
 ENTRYPOINT ["/bin/bash"]
 
+# ---------- pip mirrors (Chinese mirrors for faster downloads) ----------
+RUN mkdir -p /root/.pip && \
+    printf '[global]\ntimeout = 300\nindex-url = http://pypi.tuna.tsinghua.edu.cn/simple/\nextra-index-url = http://pypi.mirrors.ustc.edu.cn/simple/\n                  http://repo.huaweicloud.com/repository/pypi/simple\n\n[install]\ntrusted-host = pypi.tuna.tsinghua.edu.cn\n               pypi.mirrors.ustc.edu.cn\n               repo.huaweicloud.com\n' > /root/.pip/pip.conf
+
 # ---------- System deps + Docker CE for DinD ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git wget curl vim htop rsync openssh-client \
@@ -57,6 +61,16 @@ RUN pip install --no-cache-dir \
     tqdm PyYAML pydantic wrapt "asgiref>=3.7.0" wandb \
     docker kubernetes swebench
 
+# Megatron backend (EP/TP for MoE training)
+# Install TE cu12 binary first, then meta package, then torch wrapper (needs cudnn.h)
+RUN pip install --no-cache-dir megatron-core==0.16.0 mbridge==0.15.1 \
+        transformer-engine-cu12==2.12.0 transformer-engine==2.12.0 && \
+    CUDNN_INC=$(python3 -c "from pathlib import Path; import nvidia.cudnn; print(Path(nvidia.cudnn.__path__[0])/'include')") && \
+    CUDNN_LIB=$(python3 -c "from pathlib import Path; import nvidia.cudnn; print(Path(nvidia.cudnn.__path__[0])/'lib')") && \
+    MAX_JOBS=$(nproc) \
+    CPLUS_INCLUDE_PATH="${CUDNN_INC}" C_INCLUDE_PATH="${CUDNN_INC}" LIBRARY_PATH="${CUDNN_LIB}" \
+    pip install --no-cache-dir --no-build-isolation transformer-engine-torch==2.12.0
+
 # Flash Attention 2 (required for FSDP training with Qwen3)
 RUN pip install --no-cache-dir flash-attn --no-build-isolation && \
     pip install --no-cache-dir "numpy<2.3"
@@ -65,6 +79,21 @@ RUN pip install --no-cache-dir flash-attn --no-build-isolation && \
 RUN pip install --no-cache-dir playwright && \
     playwright install chromium && \
     playwright install-deps
+
+# ---------- Patch verl for megatron-core 0.16 API + JSON extra_info ----------
+COPY k8s/scripts/patch_optimizer.py /tmp/patch_optimizer.py
+RUN python3 /tmp/patch_optimizer.py && rm /tmp/patch_optimizer.py && \
+    python3 -c "\
+import verl.utils.dataset.rl_dataset as m; \
+fpath = m.__file__; \
+content = open(fpath).read(); \
+assert 'json.loads' not in content, 'already patched'; \
+content = content.replace('import copy\n', 'import copy\nimport json\n', 1); \
+old = '        if \"extra_info\" not in row_dict or row_dict[\"extra_info\"] is None:\n            row_dict[\"extra_info\"] = dict()'; \
+new = old + '\n        elif isinstance(row_dict[\"extra_info\"], str):\n            row_dict[\"extra_info\"] = json.loads(row_dict[\"extra_info\"])'; \
+content = content.replace(old, new); \
+open(fpath, 'w').write(content); \
+print('Patched verl rl_dataset.py')"
 
 # ---------- Env defaults ----------
 ENV NCCL_CUMEM_ENABLE=0
