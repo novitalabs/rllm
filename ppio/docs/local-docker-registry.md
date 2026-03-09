@@ -20,13 +20,15 @@ mergerfs union  (/data/registry-union)
 
 ## 存储节点
 
-| 节点 | 路径 | 挂载方式 | 容量 |
-|------|------|----------|------|
-| .14 (本地) | `/data/registry-cache/data` | 本地 NVMe | 7.0T |
-| .10 | `/data/registry-nfs-10` | NFS (`/data/registry-blobs`) | 7.0T |
-| .12 | `/data/registry-nfs-12` | NFS (`/data/registry-blobs`) | 7.0T |
-| .17 | `/data/registry-nfs-17` | NFS (`/data/registry-blobs`) | 7.0T |
-| **合计 (union)** | `/data/registry-union` | mergerfs | **28T** |
+| 节点 | 路径 | 挂载方式 | 容量 | 已用 | 占比 | Blob Buckets |
+|------|------|----------|------|------|------|-------------|
+| .14 (本地) | `/data/registry-cache/data` | 本地 NVMe | 7.0T | 2.3T | 33% | 65 (0a, c0-ff) |
+| .10 | `/data/registry-nfs-10` | NFS (`/data/registry-blobs`) | 7.0T | 3.1T | 44% | 85 (0b-3f, 80-9f) |
+| .12 | `/data/registry-nfs-12` | NFS (`/data/registry-blobs`) | 7.0T | 4.8T | 69% | 32 (40-5f) |
+| .17 | `/data/registry-nfs-17` | NFS (`/data/registry-blobs`) | 7.0T | 2.1T | 30% | 78 (00-09, 60-7f, a0-bf) |
+| **合计 (union)** | `/data/registry-union` | mergerfs | **28T** | **12.3T** | **44%** | **260** |
+
+> 数据截至 2026-03-09。Blob buckets 指 `docker/registry/v2/blobs/sha256/` 下的 hex prefix 目录。
 
 ## 镜像内容
 
@@ -50,7 +52,7 @@ mergerfs union  (/data/registry-union)
 mergerfs 使用 **`category.create=mfs`（Most Free Space）** 策略：
 
 - 新 blob 写入时，自动选空闲空间最多的 branch
-- 当前 .10 空间最多，新镜像优先写入 .10
+- mergerfs 自动选空闲最多的 branch（当前 .17 > .10 > .14 > .12）
 - `minfreespace=100G`：某 branch 剩余 < 100G 时停止向它写入，自动切换到另一个
 - 读取使用 `category.search=ff`（first-found），按 branch 顺序查找
 
@@ -164,7 +166,7 @@ curl -s http://localhost:5000/v2/_catalog | python3 -m json.tool
 ### 拉取缺失镜像到 registry
 
 ```bash
-# 在 .17 上（通过 proxy 从 Docker Hub 拉取，推送到 .14:5001）
+# 在 .17 上（通过 proxy 从 Docker Hub 拉取，推送到 .14:5000）
 bash k8s/scripts/pull-missing-to-registry.sh 10.83.115.14:5000
 ```
 
