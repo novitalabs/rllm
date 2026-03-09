@@ -70,6 +70,24 @@ else:
     print("[setup] verl rl_dataset.py already patched")
 PYEOF
 
+# ---------- Patch megatron-core checkpoint to allow flattened_range ----------
+# megatron-core 0.16 validate_metadata_integrity rejects flattened_range,
+# but distributed optimizer still generates ShardedTensors with it.
+python3 << 'PYEOF'
+import megatron.core.dist_checkpointing.mapping as m
+fpath = m.__file__
+with open(fpath) as f:
+    content = f.read()
+old = '        if self.flattened_range is not None:\n            raise CheckpointingException("ShardedTensor.flattened_range is not supported.")'
+if old in content:
+    content = content.replace(old, '        # flattened_range check removed for distributed optimizer compat')
+    with open(fpath, "w") as f:
+        f.write(content)
+    print("[setup] Patched megatron-core mapping.py to allow flattened_range")
+else:
+    print("[setup] megatron-core mapping.py already patched (or different version)")
+PYEOF
+
 # ---------- Phase 1: Start dockerd (DinD) ----------
 echo "[phase-1] Starting dockerd..."
 
